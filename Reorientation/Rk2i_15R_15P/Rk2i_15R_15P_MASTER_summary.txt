@@ -1,0 +1,46 @@
+=========================================================================
+ MASTER SUMMARY  (stable poses — post CSA analysis)
+ Part  : Rk2i
+ Chute : Roll = 15 deg   Pitch = 15 deg
+=========================================================================
+
+Stable poses                  : 12
+Sum of raw CSA weights (sumQ) : 6.212042
+Wall  transition threshold    : 2.7310  (l_A/l_w >= this -> transitions)
+Floor instability threshold   : 2.2960  (l_A/l_f >= this -> Qs zeroed)
+
+Pos  Plane  Theta   refQuat [w x y z]                      Omega(sr)  Height    rWall    rFloor   CSA_B(%)  CSA_A(%)  CSA_N(%)  CRSA_B(%) CRSA_A(%) CRSA_N(%) ->Dest  +From   nMerge Notes
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+1    1      180     [ 0.0000  0.7071 -0.0000  0.7071]      3.2196     8.2746    0.667    0.515    12.53     12.53     12.53     12.38     12.38     12.38     -       -       2      -
+2    1      90      [ 0.5011  0.4989 -0.5011  0.4989]      3.9547     8.2746    1.495    0.767    15.39     15.39     15.39     20.99     20.99     20.99     -       -       2      -
+3    4      180     [-0.0000  1.0000 -0.0007 -0.0000]      1.5637     16.0770   1.370    2.048    3.13      3.13      3.13      1.95      1.95      1.95      -       -       2      -
+4    4      270     [ 0.0000  0.7086  0.7056 -0.0000]      1.4601     16.0770   0.730    1.495    2.92      2.92      2.92      2.12      2.12      2.12      -       -       2      -
+5    2      180     [ 0.0007  0.0000  0.0000  1.0000]      1.5886     16.0770   1.292    1.932    3.18      3.18      3.18      2.03      2.03      2.03      -       -       2      -
+6    2      270     [-0.7056  0.0000  0.0000  0.7086]      1.4738     16.0770   0.774    1.495    2.95      2.95      2.95      2.18      2.18      2.18      -       -       2      -
+7    3      0       [ 0.7071  0.7071  0.0000  0.0000]      2.9668     10.7180   2.061    1.374    8.91      8.91      8.91      5.88      5.88      5.88      -       -       2      -
+8    3      90      [ 0.5000  0.5000  0.5000  0.5000]      2.2113     10.7180   0.485    0.667    6.64      6.64      6.64      6.14      6.14      6.14      -       -       2      -
+9    5      180     [ 0.0005 -0.0005 -0.7071  0.7071]      3.0246     10.7180   1.931    1.284    9.09      9.09      9.09      7.39      7.39      7.39      -       -       2      -
+10   5      270     [-0.5000  0.5000 -0.5000  0.5000]      2.2329     10.7180   0.515    0.667    6.71      6.71      6.71      6.42      6.42      6.42      -       -       2      -
+11   6      0       [ 0.7071  0.0000  0.7071  0.0000]      3.1065     7.8023    0.667    0.485    12.82     12.82     12.82     12.29     12.29     12.29     -       -       2      -
+12   6      270     [ 0.4989  0.5011  0.4989 -0.5011]      3.8140     7.8023    1.495    0.723    15.74     15.74     15.74     20.23     20.23     20.23     -       -       2      -
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+TOT                                                                                               100.00    100.00    100.00    100.00    100.00    100.00   
+
+Algorithm key:
+  CSA_B  = CSA,  transitioning poses zeroed, remaining renormalized  ("before")
+  CSA_A  = CSA,  transitioning poses redistribute to destination pose ("after")
+  CSA_N  = CSA,  no filtering at all (raw CSA weight normalized)     ("none")
+  CRSA_B = CRSA, transitioning poses zeroed, remaining renormalized  ("before")
+  CRSA_A = CRSA, transitioning poses redistribute to destination pose ("after")
+  CRSA_N = CRSA, no filtering at all (raw CRSA weight normalized)     ("none")
+
+  NOTE: CSA_B/CSA_A/CSA_N are computed from an UNZEROED CSA weight
+  (QsRaw), just like CRSA_B/CRSA_A/CRSA_N are computed from an
+  unzeroed crsaRaw. The "Qs"/"Q=0"/"FLOOR-UNSTABLE" notes above
+  reflect a SEPARATE validity-zeroed weight used only for pose
+  merging, sumQ, and the diagnostic plots/figures.
+
+  Transition  : wall only, l_A/l_w >= 2.7310
+  Instability : floor only, l_A/l_f >= 2.2960  (Qs zeroed)
+  rWall  = l_A/l_w moment-arm ratio (wall-tip transition driver)
+  rFloor = l_A/l_f moment-arm ratio (floor instability indicator)
