@@ -179,52 +179,60 @@ end
 % =========================================================================
 fprintf('Building transition graph...\n');
 
-% edges cols: [src, dst, cost, type, angleChangeDeg]
-edges = zeros(0,5);
+% edges cols: [src, dst, cost(score 0-1), type, angleChangeDeg, direction(+1 CW/-1 CCW/0=chain)]
+edges = zeros(0,6);
 
 maxChain  = numStable + 2;
 validPose = Qs > 0;
 
 for si = 1:numStable
     for transType = 1:3
-        [chainNodes, firstCost, tType, angleChangeDeg] = resolveTransitionChain(si, transType, ...
-            allPoses, stableIdx, refQuats, refQuatsAll, ...
-            ratioWall, ratioFloor, ratioLateral, Qs, validPose, ...
-            quatMatchTol, planeTol, wallTol, maxChain, ...
-            restingPlaneVerts, restingPlaneEqs, chullVertexIdx, ...
-            centroidCoords, planeQuats);
+        for dw = {'CW','CCW'}
+            dirWant = dw{1};
+            [chainNodes, firstCost, tType, angleChangeDeg, edgeDir] = resolveTransitionChain(si, transType, dirWant, ...
+                allPoses, stableIdx, refQuats, refQuatsAll, ...
+                ratioWall, ratioFloor, ratioLateral, Qs, validPose, ...
+                quatMatchTol, planeTol, wallTol, maxChain, ...
+                restingPlaneVerts, restingPlaneEqs, chullVertexIdx, ...
+                centroidCoords, planeQuats);
 
-        if numel(chainNodes) < 2, continue; end
+            if numel(chainNodes) < 2, continue; end
 
-        % NOTE: the max-transition-angle cap is now applied dynamically in
-        % the UI via the "Max Δ°" field, not hard-coded here — all edges
-        % are built (regardless of angle) and filtered live at query time
-        % so the cap can be adjusted without rebuilding the graph.
-        typeLabel = tType * 10;
-        for k = 1:numel(chainNodes)-1
-            s = chainNodes(k);
-            d = chainNodes(k+1);
-            if k == 1
-                c = firstCost;
-                t = transType;
-                aDeg = angleChangeDeg;
-            else
-                c = 0;
-                t = typeLabel;
-                aDeg = 0;
+            % NOTE: the max-transition-angle cap is applied dynamically in
+            % the UI via the "Max Δ°" field, not hard-coded here — all edges
+            % are built (regardless of angle) and filtered live at query time
+            % so the cap can be adjusted without rebuilding the graph. The
+            % occlusion (allowable-rotation) filter is likewise applied live
+            % but is graph-wide: occluded edges are excluded from every
+            % search mode (plain path mode included), not just sequences.
+            typeLabel = tType * 10;
+            for k = 1:numel(chainNodes)-1
+                s = chainNodes(k);
+                d = chainNodes(k+1);
+                if k == 1
+                    c = firstCost;
+                    t = transType;
+                    aDeg = angleChangeDeg;
+                    dirCol = edgeDir;
+                else
+                    c = 0;
+                    t = typeLabel;
+                    aDeg = 0;
+                    dirCol = 0;
+                end
+                dup = any(edges(:,1)==s & edges(:,2)==d & edges(:,4)==t & edges(:,6)==dirCol);
+                if ~dup
+                    edges(end+1,:) = [s, d, c, t, aDeg, dirCol]; %#ok<AGROW>
+                end
             end
-            dup = any(edges(:,1)==s & edges(:,2)==d & edges(:,4)==t);
-            if ~dup
-                edges(end+1,:) = [s, d, c, t, aDeg]; %#ok<AGROW>
-            end
-        end
 
-        tNames = {'Wall','Floor','Lateral'};
-        nodeStr = sprintf('%d', chainNodes(1));
-        for k=2:numel(chainNodes)
-            nodeStr = [nodeStr sprintf('->%d', chainNodes(k))]; %#ok<AGROW>
+            tNames = {'Wall','Floor','Lateral'};
+            nodeStr = sprintf('%d', chainNodes(1));
+            for k=2:numel(chainNodes)
+                nodeStr = [nodeStr sprintf('->%d', chainNodes(k))]; %#ok<AGROW>
+            end
+            fprintf('  %s[%s]: %s  (score=%.3f, angle=%.1f deg)\n', tNames{transType}, dirWant, nodeStr, firstCost, angleChangeDeg);
         end
-        fprintf('  %s: %s  (cost=%.3f, angle=%.1f deg)\n', tNames{transType}, nodeStr, firstCost, angleChangeDeg);
     end
 end
 
@@ -331,7 +339,7 @@ uipanel(hFig, 'Units','normalized', 'Position',[0.005, 0.005, 0.990, 0.115], ...
     'Title','Sequence Constraints', 'FontSize',8, 'FontWeight','bold', 'BorderType','line');
 
 seqOpts    = {'—','Wall','Floor','Lateral'};
-numSeqSlots = 6;
+numSeqSlots = 5;
 hSeqDD     = gobjects(numSeqSlots,1);
 
 ddW  = 0.072; ddH = 0.50; ddBot = 0.08;
@@ -413,8 +421,30 @@ hTypeFilter = uicontrol(hFig,'Style','listbox', ...
     'Value',[1 2 3], ...          % all selected by default
     'Callback',@onSeqChange);
 
+% ── Allowable-rotation occlusion filter (multi-select) ──────────────────
+% Bands are checked against each edge's own physical rotation axis
+% (Wall=Z, Floor=Y, Lateral=X); CW = signed rotation angle > 0 (the
+% convention where the part sweeps from quadrant IV toward quadrant I
+% about that axis), CCW = signed angle < 0. Edges whose (angle,direction)
+% doesn't fall inside a selected band (±2° tolerance) are occluded —
+% dropped from the graph entirely, for every search mode.
+occX = filtX + 0.093;
+annotation(hFig,'textbox', ...
+    [0.005+occX*0.990, 0.005+ddBot*0.115+ddH*0.115+0.005, 0.070*0.990, 0.013], ...
+    'String','Allow Rot','Color',[0.48 0.52 0.62],'FontSize',6.5, ...
+    'EdgeColor','none','BackgroundColor','none','HorizontalAlignment','center');
+hOcclusionFilter = uicontrol(hFig,'Style','listbox', ...
+    'String',{'90° CW','180° CW','90° CCW','180° CCW'}, ...
+    'Units','normalized', ...
+    'Position',[0.005+occX*0.990, 0.005+ddBot*0.115, 0.070*0.990, ddH*0.115*1.25], ...
+    'BackgroundColor',[0.13 0.15 0.20],'ForegroundColor',[0.88 0.92 1.00], ...
+    'FontSize',8, ...
+    'Max',4,'Min',0, ...          % multi-select
+    'Value',[1 2 3 4], ...        % all bands allowed by default
+    'Callback',@onSeqChange);
+
 % ── Max transition angle cap (deg) ──────────────────────────────────────
-angX = filtX + 0.093;
+angX = occX + 0.075;
 annotation(hFig,'textbox', ...
     [0.005+angX*0.990, 0.005+ddBot*0.115+ddH*0.115+0.005, 0.062*0.990, 0.013], ...
     'String','Max Δ°','Color',[0.48 0.52 0.62],'FontSize',6.5, ...
@@ -519,6 +549,39 @@ pathHandles = {};
     % ------------------------------------------------------------------
     function eFiltered = filterEdgesByAngle(edgesIn, maxDeg)
         keep = edgesIn(:,5) <= maxDeg;
+        eFiltered = edgesIn(keep,:);
+    end
+
+    % ------------------------------------------------------------------
+    %  Get currently allowed occlusion bands: rows of [centerDeg, dirSign, tol]
+    % ------------------------------------------------------------------
+    function bands = getAllowedOcclusionBands()
+        sel = hOcclusionFilter.Value;
+        allBands = [90,1,2; 180,1,2; 90,-1,2; 180,-1,2];
+        bands = allBands(sel,:);
+        if isempty(bands), bands = zeros(0,3); end  % nothing selected -> all real edges occluded
+    end
+
+    % ------------------------------------------------------------------
+    %  Filter edges by allowable-rotation occlusion. Only "real" first-hop
+    %  edges (col3>0, direction column nonzero) carry a physical rotation
+    %  and are checked; free chain-continuation edges (col3==0) are left
+    %  alone here, since occluding the parent first-hop already makes the
+    %  whole chain unreachable via graph connectivity.
+    % ------------------------------------------------------------------
+    function eFiltered = filterEdgesByOcclusion(edgesIn, allowedBands)
+        keep = true(size(edgesIn,1),1);
+        for ei2 = 1:size(edgesIn,1)
+            if edgesIn(ei2,6) == 0, continue; end   % chain edge, not a physical rotation
+            angDeg = edgesIn(ei2,5); dirSign = edgesIn(ei2,6);
+            allowedHere = false;
+            for b = 1:size(allowedBands,1)
+                if dirSign == allowedBands(b,2) && abs(angDeg - allowedBands(b,1)) <= allowedBands(b,3)
+                    allowedHere = true; break;
+                end
+            end
+            if ~allowedHere, keep(ei2) = false; end
+        end
         eFiltered = edgesIn(keep,:);
     end
 
@@ -661,6 +724,7 @@ pathHandles = {};
         maxDeg  = getMaxAngle();
         eF      = filterEdgesByType(edges, allowed);
         eF      = filterEdgesByAngle(eF, maxDeg);
+        eF = filterEdgesByOcclusion(eF, getAllowedOcclusionBands());
 
         if state.globalSeqMode
             results = computeOptimalSequencesGlobal(numStable, eF, validPose, useCost, maxDeg);
@@ -717,6 +781,7 @@ pathHandles = {};
         maxDeg  = getMaxAngle();
         eF = filterEdgesByType(edges, allowed);
         eF = filterEdgesByAngle(eF, maxDeg);
+        eF = filterEdgesByOcclusion(eF, getAllowedOcclusionBands());
 
         [~, edgesS] = bfsShortestPath(A, B, numStable, eF);
         [~, edgesC] = dijkstraCheapestPath(A, B, numStable, eF);
@@ -796,6 +861,7 @@ pathHandles = {};
         maxDeg  = getMaxAngle();
         eF      = filterEdgesByType(edges, allowed);
         eF      = filterEdgesByAngle(eF, maxDeg);
+        eF = filterEdgesByOcclusion(eF, getAllowedOcclusionBands());
 
         if isToEnd
             % "→ END": find all START poses that can reach anchor via seq.
@@ -860,6 +926,7 @@ pathHandles = {};
         maxDeg  = getMaxAngle();
         eF      = filterEdgesByType(edges, allowed);
         eF      = filterEdgesByAngle(eF, maxDeg);
+        eF = filterEdgesByOcclusion(eF, getAllowedOcclusionBands());
 
         allResults = struct('startPose',{},'endPose',{},'edgeIdxList',{},'hops',{},'cost',{});
         for anchor = 1:numStable
@@ -933,6 +1000,7 @@ pathHandles = {};
         maxDeg  = getMaxAngle();
         eF      = filterEdgesByType(edges, allowed);
         eF      = filterEdgesByAngle(eF, maxDeg);
+        eF = filterEdgesByOcclusion(eF, getAllowedOcclusionBands());
 
         res = seqConstrainedSearch(A, B, seq, numStable, eF, useCost, maxDeg);
         clearPathHandles();
@@ -1768,33 +1836,44 @@ end
 
 % =========================================================================
 %  resolveTransitionChain
+%  dirWant ('CW'/'CCW') governs ONLY the first physical hop of the chain;
+%  subsequent free-settle steps use 'auto' (natural continuation).
+%  CW/CCW convention: CW is when the part rotates about the transition's
+%  own axis (Wall=Z, Floor=Y, Lateral=X) in the direction that sweeps a
+%  reference point from quadrant IV to quadrant I (truePhi > 0); CCW is
+%  the opposite (truePhi < 0).
 % =========================================================================
-function [chainNodes,firstCost,transType,angleChangeDeg]=resolveTransitionChain( ...
-    srcSi,transType,allPoses,stableIdx,refQuats,refQuatsAll, ...
+function [chainNodes,firstCost,transType,angleChangeDeg,edgeDir]=resolveTransitionChain( ...
+    srcSi,transType,dirWant,allPoses,stableIdx,refQuats,refQuatsAll, ...
     ratioWall,ratioFloor,ratioLateral,Qs,validPose, ...
     quatMatchTol,planeTol,wallTol,maxChain, ...
     restingPlaneVerts,restingPlaneEqs,chullVertexIdx, ...
-    centroidCoords,planeQuats)
-chainNodes=[]; firstCost=0; angleChangeDeg=0;
-if transType==1, firstCost=ratioWall(srcSi);
-elseif transType==2, firstCost=ratioFloor(srcSi);
-else, firstCost=ratioLateral(srcSi); end
+    centroidCoords,planeQuats) %#ok<INUSL>
+chainNodes=[]; firstCost=0; angleChangeDeg=0; edgeDir=0;
 visited=false(numel(stableIdx),1); visited(srcSi)=true;
 curSi=srcSi; chain=srcSi;
 for chainStep=1:maxChain
     [vertsC,centC]=initPose(curSi,allPoses,stableIdx); pos0=allPoses(stableIdx(curSi));
+    dw = 'auto'; if chainStep==1, dw = dirWant; end
     if transType==1
         contactIdx=pos0.wallContactVertIdx(:);
-        [vertsR,centR,~,~,~,q_rot]=wallRotation_q(vertsC,centC,contactIdx);
+        [vertsR,centR,~,~,~,q_rot,truePhi,dStr]=wallRotation_q(vertsC,centC,contactIdx,dw);
     elseif transType==2
         contactIdx=pos0.floorContactVertIdx(:);
-        [vertsR,centR,~,~,~,q_rot]=floorRotation_q(vertsC,centC,contactIdx);
+        [vertsR,centR,~,~,~,q_rot,truePhi,dStr]=floorRotation_q(vertsC,centC,contactIdx,dw);
     else
         contactIdx=pos0.floorContactVertIdx(:);
-        [vertsR,centR,~,~,~,q_rot]=lateralRotation_q(vertsC,centC,contactIdx);
+        [vertsR,centR,~,~,~,q_rot,truePhi,dStr]=lateralRotation_q(vertsC,centC,contactIdx,dw);
     end
-    if ~isempty(q_rot)&&chainStep==1
-        q_id=[1 0 0 0]; angleChangeDeg=rad2deg(q_geodesic(q_id,q_rot));
+    if chainStep==1
+        if isempty(q_rot)
+            % requested rotation direction isn't geometrically available
+            % for this pose/pivot -> no edge for this (transType,dirWant)
+            chainNodes=[]; return;
+        end
+        angleChangeDeg = rad2deg(abs(truePhi));
+        edgeDir = 1; if strcmp(dStr,'CCW'), edgeDir = -1; end
+        firstCost = min(angleChangeDeg/180, 1);   % SCORE: 0=free, 1=max costly (180deg)
     end
     q_acc=refQuats(curSi,:);
     if ~isempty(q_rot)
@@ -1855,9 +1934,17 @@ end
 
 % =========================================================================
 %  WALL / FLOOR / LATERAL ROTATION
+%  Each function now supports dirWant = 'auto' | 'CW' | 'CCW'. Two pivot
+%  neighbours are considered (the original "next" hull neighbour, and the
+%  opposite "prev" neighbour); each yields its own signed rotation, and we
+%  return whichever candidate matches the requested direction. 'auto'
+%  reproduces the original single-candidate behaviour exactly. If the
+%  requested direction has no valid geometric candidate for this pose,
+%  q_rot is returned empty (caller treats this as "no edge").
 % =========================================================================
-function [vertsR,centR,phi,pivotOut,axisOut,q_rot]=wallRotation_q(vertsC,centC,wallIdx)
-vertsR=[]; centR=[]; phi=0; pivotOut=[0,0,0]; axisOut=[0,0,1]; q_rot=[];
+function [vertsR,centR,phi,pivotOut,axisOut,q_rot,truePhi,dirStr]=wallRotation_q(vertsC,centC,wallIdx,dirWant)
+if nargin<4, dirWant='auto'; end
+vertsR=[]; centR=[]; phi=0; pivotOut=[0,0,0]; axisOut=[0,0,1]; q_rot=[]; truePhi=0; dirStr='';
 if isempty(wallIdx), return; end
 wallV=vertsC(wallIdx,:); [~,pivLoc]=max(wallV(:,1)); pivot=wallV(pivLoc,:); pivotOut=pivot;
 hullIdx3D=p4_hullIdx(vertsC); if numel(hullIdx3D)<3, return; end
@@ -1869,15 +1956,40 @@ ord2D=ord2D(1:end-1); pts2D=hXY(ord2D,:); M=size(pts2D,1); if M<2, return; end
 pivXY=pivot(1:2); dists=vecnorm(pts2D-pivXY,2,2); [~,pivLoc2D]=min(dists);
 prevLoc=mod(pivLoc2D-2,M)+1; nextLoc=mod(pivLoc2D,M)+1;
 prevXY=pts2D(prevLoc,:); nextXY=pts2D(nextLoc,:);
-if nextXY(1)>=prevXY(1), neighXY=nextXY; else, neighXY=prevXY; end
-dX=neighXY(1)-pivXY(1); dY=neighXY(2)-pivXY(2);
-phi=atan2(-dY,dX); if abs(phi)<1e-8, return; end
+
+dXn=nextXY(1)-pivXY(1); dYn=nextXY(2)-pivXY(2); phiN=atan2(-dYn,dXn);
+dXp=prevXY(1)-pivXY(1); dYp=prevXY(2)-pivXY(2); phiP=atan2(-dYp,dXp);
+
+cands=struct('phi',{},'truePhi',{},'dir',{});
+if abs(phiN)>=1e-8
+    d='CW'; if phiN<0, d='CCW'; end
+    cands(end+1)=struct('phi',phiN,'truePhi',phiN,'dir',d);
+end
+if abs(phiP)>=1e-8
+    d='CW'; if phiP<0, d='CCW'; end
+    cands(end+1)=struct('phi',phiP,'truePhi',phiP,'dir',d);
+end
+if isempty(cands), return; end
+
+switch dirWant
+    case 'auto'
+        if abs(phiN)>=1e-8, chosen=cands(1); else, chosen=cands(end); end
+    case {'CW','CCW'}
+        idx=find(strcmp({cands.dir},dirWant),1);
+        if isempty(idx), return; end
+        chosen=cands(idx);
+    otherwise
+        chosen=cands(1);
+end
+
+phi=chosen.phi; truePhi=chosen.truePhi; dirStr=chosen.dir;
 q_rot=q_fromAxisAngle([0,0,1],phi); axisOut=[0,0,1];
 [vertsR,centR]=q_rotateCloud(q_rot,vertsC,pivot,centC);
 end
 
-function [vertsR,centR,phi,pivotOut,axisOut,q_rot]=floorRotation_q(vertsC,centC,floorIdx)
-vertsR=[]; centR=[]; phi=0; pivotOut=[0,0,0]; axisOut=[0,1,0]; q_rot=[];
+function [vertsR,centR,phi,pivotOut,axisOut,q_rot,truePhi,dirStr]=floorRotation_q(vertsC,centC,floorIdx,dirWant)
+if nargin<4, dirWant='auto'; end
+vertsR=[]; centR=[]; phi=0; pivotOut=[0,0,0]; axisOut=[0,1,0]; q_rot=[]; truePhi=0; dirStr='';
 if isempty(floorIdx), return; end
 floorV=vertsC(floorIdx,:); [~,pivLoc]=max(floorV(:,1)); pivot=floorV(pivLoc,:); pivotOut=pivot;
 hullIdx3D=p4_hullIdx(vertsC); if numel(hullIdx3D)<3, return; end
@@ -1889,15 +2001,40 @@ ord2D=ord2D(1:end-1); pts2D=hXZ(ord2D,:); M=size(pts2D,1); if M<2, return; end
 pivXZ=pivot([1 3]); dists=vecnorm(pts2D-pivXZ,2,2); [~,pivLoc2D]=min(dists);
 prevLoc=mod(pivLoc2D-2,M)+1; nextLoc=mod(pivLoc2D,M)+1;
 prevXZ=pts2D(prevLoc,:); nextXZ=pts2D(nextLoc,:);
-if nextXZ(1)>=prevXZ(1), neighXZ=nextXZ; else, neighXZ=prevXZ; end
-dX=neighXZ(1)-pivXZ(1); dZ=neighXZ(2)-pivXZ(2);
-phi=atan2(-dZ,dX); if abs(phi)<1e-8, return; end
+
+dXn=nextXZ(1)-pivXZ(1); dZn=nextXZ(2)-pivXZ(2); phiN=atan2(-dZn,dXn);
+dXp=prevXZ(1)-pivXZ(1); dZp=prevXZ(2)-pivXZ(2); phiP=atan2(-dZp,dXp);
+
+cands=struct('phi',{},'truePhi',{},'dir',{});
+if abs(phiN)>=1e-8
+    tp=-phiN; d='CW'; if tp<0, d='CCW'; end
+    cands(end+1)=struct('phi',phiN,'truePhi',tp,'dir',d);
+end
+if abs(phiP)>=1e-8
+    tp=-phiP; d='CW'; if tp<0, d='CCW'; end
+    cands(end+1)=struct('phi',phiP,'truePhi',tp,'dir',d);
+end
+if isempty(cands), return; end
+
+switch dirWant
+    case 'auto'
+        if abs(phiN)>=1e-8, chosen=cands(1); else, chosen=cands(end); end
+    case {'CW','CCW'}
+        idx=find(strcmp({cands.dir},dirWant),1);
+        if isempty(idx), return; end
+        chosen=cands(idx);
+    otherwise
+        chosen=cands(1);
+end
+
+phi=chosen.phi; truePhi=chosen.truePhi; dirStr=chosen.dir;
 q_rot=q_fromAxisAngle([0,1,0],-phi); axisOut=[0,1,0];
 [vertsR,centR]=q_rotateCloud(q_rot,vertsC,pivot,centC);
 end
 
-function [vertsR,centR,phi,pivotOut,axisOut,q_rot]=lateralRotation_q(vertsC,centC,floorIdx)
-vertsR=[]; centR=[]; phi=0; pivotOut=[0,0,0]; axisOut=[1,0,0]; q_rot=[];
+function [vertsR,centR,phi,pivotOut,axisOut,q_rot,truePhi,dirStr]=lateralRotation_q(vertsC,centC,floorIdx,dirWant)
+if nargin<4, dirWant='auto'; end
+vertsR=[]; centR=[]; phi=0; pivotOut=[0,0,0]; axisOut=[1,0,0]; q_rot=[]; truePhi=0; dirStr='';
 if isempty(floorIdx), return; end
 floorV=vertsC(floorIdx,:); [~,pivLoc]=min(floorV(:,2)); pivot=floorV(pivLoc,:); pivotOut=pivot;
 hullIdx3D=p4_hullIdx(vertsC); if numel(hullIdx3D)<3, return; end
@@ -1909,9 +2046,33 @@ ord2D=ord2D(1:end-1); pts2D=hYZ(ord2D,:); M=size(pts2D,1); if M<2, return; end
 pivYZ=pivot([2 3]); dists=vecnorm(pts2D-pivYZ,2,2); [~,pivLoc2D]=min(dists);
 prevLoc=mod(pivLoc2D-2,M)+1; nextLoc=mod(pivLoc2D,M)+1;
 prevYZ=pts2D(prevLoc,:); nextYZ=pts2D(nextLoc,:);
-if nextYZ(1)<=prevYZ(1), neighYZ=nextYZ; else, neighYZ=prevYZ; end
-dY=neighYZ(1)-pivYZ(1); dZ=neighYZ(2)-pivYZ(2);
-phi=atan2(-dZ,-dY); if abs(phi)<1e-8, return; end
+
+dYn=nextYZ(1)-pivYZ(1); dZn=nextYZ(2)-pivYZ(2); phiN=atan2(-dZn,-dYn);
+dYp=prevYZ(1)-pivYZ(1); dZp=prevYZ(2)-pivYZ(2); phiP=atan2(-dZp,-dYp);
+
+cands=struct('phi',{},'truePhi',{},'dir',{});
+if abs(phiN)>=1e-8
+    d='CW'; if phiN<0, d='CCW'; end
+    cands(end+1)=struct('phi',phiN,'truePhi',phiN,'dir',d);
+end
+if abs(phiP)>=1e-8
+    d='CW'; if phiP<0, d='CCW'; end
+    cands(end+1)=struct('phi',phiP,'truePhi',phiP,'dir',d);
+end
+if isempty(cands), return; end
+
+switch dirWant
+    case 'auto'
+        if abs(phiN)>=1e-8, chosen=cands(1); else, chosen=cands(end); end
+    case {'CW','CCW'}
+        idx=find(strcmp({cands.dir},dirWant),1);
+        if isempty(idx), return; end
+        chosen=cands(idx);
+    otherwise
+        chosen=cands(1);
+end
+
+phi=chosen.phi; truePhi=chosen.truePhi; dirStr=chosen.dir;
 q_rot=q_fromAxisAngle([1,0,0],phi); axisOut=[1,0,0];
 [vertsR,centR]=q_rotateCloud(q_rot,vertsC,pivot,centC);
 end
