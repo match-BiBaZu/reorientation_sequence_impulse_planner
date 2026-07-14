@@ -1,14 +1,23 @@
 % =========================================================================
 % ChuteTransitionSolver.m  —  Pose Transition Network Solver
 % =========================================================================
+%
+% Transition type encoding (locked convention — do not renumber; every
+% place that hard-codes 1:N or switches on transType/prim refers back to
+% this):
+%   1 = Down-Wall
+%   2 = Down-Floor
+%   3 = Up-Wall
+%   4 = Up-Floor
+%
 function ChuteTransitionSolver()
 
 close all; clc;
 
 THRESH_WALL    = 2.731;
 THRESH_FLOOR   = 2.296;
-THRESH_LATERAL = 2.296;
-
+MAX_HOP_ANGLE_DEG = 180;  
+ANGLE_COST_DENOM  = 180;
 wallTol       = 0.1;
 planeTol      = 0.08;
 thetaTol_deg  = 2;
@@ -140,13 +149,12 @@ if numStable == 0, errordlg('No poses passed secondary stability.','Error'); ret
 numStable = numel(stableIdx);
 fprintf('  After CSA merge: %d poses\n', numStable);
 
-[ratioWall, ratioFloor, ratioLateral, ~, ~] = computeTransitionRatios( ...
+[ratioWall, ratioFloor, ~, ~] = computeTransitionRatios( ...
     allPoses, stableIdx, Rchute, slideDir, floorNorm_c, wallNorm_c, planeTol);
 
 for si = 1:numStable
     if ratioFloor(si)   >= THRESH_FLOOR   || ...
-       ratioWall(si)    >= THRESH_WALL    || ...
-       ratioLateral(si) >= THRESH_LATERAL
+       ratioWall(si)    >= THRESH_WALL
         Qs(si) = 0;
     end
 end
@@ -179,67 +187,68 @@ end
 % =========================================================================
 fprintf('Building transition graph...\n');
 
-% edges cols: [src, dst, cost(score 0-1), type, angleChangeDeg, direction(+1 CW/-1 CCW/0=chain)]
-edges = zeros(0,6);
+% edges cols: [src, dst, cost, type, angleChangeDeg]
+edges = zeros(0,5);
 
 maxChain  = numStable + 2;
 validPose = Qs > 0;
 
 for si = 1:numStable
-    for transType = 1:3
-        for dw = {'CW','CCW'}
-            dirWant = dw{1};
-            [chainNodes, firstCost, tType, angleChangeDeg, edgeDir] = resolveTransitionChain(si, transType, dirWant, ...
-                allPoses, stableIdx, refQuats, refQuatsAll, ...
-                ratioWall, ratioFloor, ratioLateral, Qs, validPose, ...
-                quatMatchTol, planeTol, wallTol, maxChain, ...
-                restingPlaneVerts, restingPlaneEqs, chullVertexIdx, ...
-                centroidCoords, planeQuats);
+    for transType = 1:4
+        angleCap = MAX_HOP_ANGLE_DEG;   % same 180° single-hop budget for all
+                                         % four transition types (Down-Wall,
+                                         % Down-Floor, Up-Wall, Up-Floor) —
+                                         % a chain whose cumulative rotation
+                                         % would exceed this before reaching
+                                         % the next stable face is not a
+                                         % valid single hop and gets no edge;
+                                         % it must be split into two (or
+                                         % more) separate transitions.
+        [chainNodes, firstCost, tType, angleChangeDeg] = resolveTransitionChain(si, transType, ...
+            allPoses, stableIdx, refQuats, refQuatsAll, ...
+            Qs, validPose, ...
+            quatMatchTol, planeTol, wallTol, maxChain, ...
+            restingPlaneVerts, restingPlaneEqs, chullVertexIdx, ...
+            centroidCoords, planeQuats, angleCap, ANGLE_COST_DENOM);
 
-            if numel(chainNodes) < 2, continue; end
+        if numel(chainNodes) < 2, continue; end
 
-            % NOTE: the max-transition-angle cap is applied dynamically in
-            % the UI via the "Max Δ°" field, not hard-coded here — all edges
-            % are built (regardless of angle) and filtered live at query time
-            % so the cap can be adjusted without rebuilding the graph. The
-            % occlusion (allowable-rotation) filter is likewise applied live
-            % but is graph-wide: occluded edges are excluded from every
-            % search mode (plain path mode included), not just sequences.
-            typeLabel = tType * 10;
-            for k = 1:numel(chainNodes)-1
-                s = chainNodes(k);
-                d = chainNodes(k+1);
-                if k == 1
-                    c = firstCost;
-                    t = transType;
-                    aDeg = angleChangeDeg;
-                    dirCol = edgeDir;
-                else
-                    c = 0;
-                    t = typeLabel;
-                    aDeg = 0;
-                    dirCol = 0;
-                end
-                dup = any(edges(:,1)==s & edges(:,2)==d & edges(:,4)==t & edges(:,6)==dirCol);
-                if ~dup
-                    edges(end+1,:) = [s, d, c, t, aDeg, dirCol]; %#ok<AGROW>
-                end
+        % NOTE: the max-transition-angle cap is now applied dynamically in
+        % the UI via the "Max Δ°" field, not hard-coded here — all edges
+        % are built (regardless of angle) and filtered live at query time
+        % so the cap can be adjusted without rebuilding the graph.
+        typeLabel = tType * 10;
+        for k = 1:numel(chainNodes)-1
+            s = chainNodes(k);
+            d = chainNodes(k+1);
+            if k == 1
+                c = firstCost;
+                t = transType;
+                aDeg = angleChangeDeg;
+            else
+                c = 0;
+                t = typeLabel;
+                aDeg = 0;
             end
-
-            tNames = {'Wall','Floor','Lateral'};
-            nodeStr = sprintf('%d', chainNodes(1));
-            for k=2:numel(chainNodes)
-                nodeStr = [nodeStr sprintf('->%d', chainNodes(k))]; %#ok<AGROW>
+            dup = any(edges(:,1)==s & edges(:,2)==d & edges(:,4)==t);
+            if ~dup
+                edges(end+1,:) = [s, d, c, t, aDeg]; %#ok<AGROW>
             end
-            fprintf('  %s[%s]: %s  (score=%.3f, angle=%.1f deg)\n', tNames{transType}, dirWant, nodeStr, firstCost, angleChangeDeg);
         end
+
+        tNames = {'Down-Wall','Down-Floor','Up-Wall','Up-Floor'};
+        nodeStr = sprintf('%d', chainNodes(1));
+        for k=2:numel(chainNodes)
+            nodeStr = [nodeStr sprintf('->%d', chainNodes(k))]; %#ok<AGROW>
+        end
+        fprintf('  %s: %s  (cost=%.3f, angle=%.1f deg)\n', tNames{transType}, nodeStr, firstCost, angleChangeDeg);
     end
 end
 
 fprintf('Total edges: %d\n', size(edges,1));
 
-launchUI(numStable, stableIdx, allPoses, Qs, ratioWall, ratioFloor, ratioLateral, ...
-    THRESH_WALL, THRESH_FLOOR, THRESH_LATERAL, edges, partName, ...
+launchUI(numStable, stableIdx, allPoses, Qs, ratioWall, ratioFloor, ...
+    THRESH_WALL, THRESH_FLOOR, edges, partName, ...
     chuteRoll_deg, chutePitch_deg, validPose, Rchute, partFaces);
 
 end % ChuteTransitionSolver
@@ -248,8 +257,8 @@ end % ChuteTransitionSolver
 % =========================================================================
 %  INTERACTIVE UI
 % =========================================================================
-function launchUI(numStable, stableIdx, allPoses, Qs, ratioWall, ratioFloor, ratioLateral, ...
-    THRESH_WALL, THRESH_FLOOR, THRESH_LATERAL, edges, partName, rollDeg, pitchDeg, validPose, Rchute, partFaces)
+function launchUI(numStable, stableIdx, allPoses, Qs, ratioWall, ratioFloor, ...
+    THRESH_WALL, THRESH_FLOOR, edges, partName, rollDeg, pitchDeg, validPose, Rchute, partFaces)
 
 % ── state ──────────────────────────────────────────────────────────────
 state.selA     = 0;
@@ -338,8 +347,8 @@ uipanel(hFig, 'Units','normalized', 'Position',[0.005, 0.005, 0.990, 0.115], ...
     'BackgroundColor',[0.08 0.09 0.12], 'ForegroundColor',[0.45 0.50 0.60], ...
     'Title','Sequence Constraints', 'FontSize',8, 'FontWeight','bold', 'BorderType','line');
 
-seqOpts    = {'—','Wall','Floor','Lateral'};
-numSeqSlots = 5;
+seqOpts    = {'—','Down-Wall','Down-Floor','Up-Wall','Up-Floor'};
+numSeqSlots = 6;
 hSeqDD     = gobjects(numSeqSlots,1);
 
 ddW  = 0.072; ddH = 0.50; ddBot = 0.08;
@@ -412,39 +421,17 @@ annotation(hFig,'textbox', ...
     'String','Allow Types','Color',[0.48 0.52 0.62],'FontSize',6.5, ...
     'EdgeColor','none','BackgroundColor','none','HorizontalAlignment','center');
 hTypeFilter = uicontrol(hFig,'Style','listbox', ...
-    'String',{'Wall','Floor','Lateral'}, ...
+    'String',{'Down-Wall','Down-Floor','Up-Wall','Up-Floor'}, ...
     'Units','normalized', ...
     'Position',[0.005+filtX*0.990, 0.005+ddBot*0.115, 0.088*0.990, ddH*0.115*1.25], ...
     'BackgroundColor',[0.13 0.15 0.20],'ForegroundColor',[0.88 0.92 1.00], ...
     'FontSize',8, ...
-    'Max',3,'Min',0, ...          % multi-select
-    'Value',[1 2 3], ...          % all selected by default
-    'Callback',@onSeqChange);
-
-% ── Allowable-rotation occlusion filter (multi-select) ──────────────────
-% Bands are checked against each edge's own physical rotation axis
-% (Wall=Z, Floor=Y, Lateral=X); CW = signed rotation angle > 0 (the
-% convention where the part sweeps from quadrant IV toward quadrant I
-% about that axis), CCW = signed angle < 0. Edges whose (angle,direction)
-% doesn't fall inside a selected band (±2° tolerance) are occluded —
-% dropped from the graph entirely, for every search mode.
-occX = filtX + 0.093;
-annotation(hFig,'textbox', ...
-    [0.005+occX*0.990, 0.005+ddBot*0.115+ddH*0.115+0.005, 0.070*0.990, 0.013], ...
-    'String','Allow Rot','Color',[0.48 0.52 0.62],'FontSize',6.5, ...
-    'EdgeColor','none','BackgroundColor','none','HorizontalAlignment','center');
-hOcclusionFilter = uicontrol(hFig,'Style','listbox', ...
-    'String',{'90° CW','180° CW','90° CCW','180° CCW'}, ...
-    'Units','normalized', ...
-    'Position',[0.005+occX*0.990, 0.005+ddBot*0.115, 0.070*0.990, ddH*0.115*1.25], ...
-    'BackgroundColor',[0.13 0.15 0.20],'ForegroundColor',[0.88 0.92 1.00], ...
-    'FontSize',8, ...
     'Max',4,'Min',0, ...          % multi-select
-    'Value',[1 2 3 4], ...        % all bands allowed by default
+    'Value',[1 2 3 4], ...        % all selected by default
     'Callback',@onSeqChange);
 
 % ── Max transition angle cap (deg) ──────────────────────────────────────
-angX = occX + 0.075;
+angX = filtX + 0.093;
 annotation(hFig,'textbox', ...
     [0.005+angX*0.990, 0.005+ddBot*0.115+ddH*0.115+0.005, 0.062*0.990, 0.013], ...
     'String','Max Δ°','Color',[0.48 0.52 0.62],'FontSize',6.5, ...
@@ -458,12 +445,14 @@ hMaxAngleEdit = uicontrol(hFig,'Style','edit','String','180', ...
 % ── static background edges ────────────────────────────────────────────
 for ei = 1:size(edges,1)
     s = edges(ei,1); d = edges(ei,2); t = edges(ei,4); aDeg = edges(ei,5);
-    if     t == 1,  col = [0.28 0.52 0.88]; ls = '-';
-    elseif t == 2,  col = [0.28 0.76 0.52]; ls = '-';
-    elseif t == 3,  col = [0.82 0.42 0.88]; ls = '-';
+    if     t == 1,  col = [0.28 0.52 0.88]; ls = '-';   % Down-Wall  (blue)
+    elseif t == 2,  col = [0.28 0.76 0.52]; ls = '-';   % Down-Floor (green)
+    elseif t == 3,  col = [0.90 0.55 0.15]; ls = '-';   % Up-Wall    (orange)
+    elseif t == 4,  col = [0.90 0.30 0.30]; ls = '-';   % Up-Floor   (red-orange)
     elseif t == 10, col = [0.28 0.52 0.88]; ls = '--';
     elseif t == 20, col = [0.28 0.76 0.52]; ls = '--';
-    else,           col = [0.82 0.42 0.88]; ls = '--';
+    elseif t == 30, col = [0.90 0.55 0.15]; ls = '--';
+    else,           col = [0.90 0.30 0.30]; ls = '--';
     end
     bgLbl = [];
     if aDeg > 0.5, bgLbl = sprintf('%.0f°', aDeg); end
@@ -477,8 +466,8 @@ hBubbleSub = gobjects(numStable,1);
 
 for si = 1:numStable
     pos = allPoses(stableIdx(si));
-    [faceC, edgeC] = bubbleColors(si, ratioWall, ratioFloor, ratioLateral, ...
-        THRESH_WALL, THRESH_FLOOR, THRESH_LATERAL, Qs);
+    [faceC, edgeC] = bubbleColors(si, ratioWall, ratioFloor, ...
+        THRESH_WALL, THRESH_FLOOR, Qs);
     th   = linspace(0,2*pi,64);
     xCir = xPos(si) + bRad*cos(th);
     yCir = yPos(si) + bRad*sin(th);
@@ -503,11 +492,11 @@ pathHandles = {};
 
     % ------------------------------------------------------------------
     %  Get currently allowed transition types from filter listbox
-    %  Returns a logical [allowWall, allowFloor, allowLateral]
+    %  Returns a logical [allowDnWall, allowDnFloor, allowUpWall, allowUpFloor]
     % ------------------------------------------------------------------
     function allowed = getAllowedTypes()
-        sel = hTypeFilter.Value;   % indices of selected items (1=Wall,2=Floor,3=Lateral)
-        allowed = [any(sel==1), any(sel==2), any(sel==3)];
+        sel = hTypeFilter.Value;   % indices of selected items (1=Down-Wall,2=Down-Floor,3=Up-Wall,4=Up-Floor)
+        allowed = [any(sel==1), any(sel==2), any(sel==3), any(sel==4)];
     end
 
     % ------------------------------------------------------------------
@@ -517,10 +506,11 @@ pathHandles = {};
         keep = true(size(edgesIn,1),1);
         for ei2 = 1:size(edgesIn,1)
             t = edgesIn(ei2,4);
-            prim = mod(t-1,10)+1;   % 1=wall, 2=floor, 3=lateral
+            prim = mod(t-1,10)+1;   % 1=dnWall,2=dnFloor,3=upWall,4=upFloor
             if prim == 1 && ~allowed(1), keep(ei2) = false; end
             if prim == 2 && ~allowed(2), keep(ei2) = false; end
             if prim == 3 && ~allowed(3), keep(ei2) = false; end
+            if prim == 4 && ~allowed(4), keep(ei2) = false; end
         end
         eFiltered = edgesIn(keep,:);
         % Re-index: edge src/dst are pose indices (1..numStable), not edge indices,
@@ -549,39 +539,6 @@ pathHandles = {};
     % ------------------------------------------------------------------
     function eFiltered = filterEdgesByAngle(edgesIn, maxDeg)
         keep = edgesIn(:,5) <= maxDeg;
-        eFiltered = edgesIn(keep,:);
-    end
-
-    % ------------------------------------------------------------------
-    %  Get currently allowed occlusion bands: rows of [centerDeg, dirSign, tol]
-    % ------------------------------------------------------------------
-    function bands = getAllowedOcclusionBands()
-        sel = hOcclusionFilter.Value;
-        allBands = [90,1,2; 180,1,2; 90,-1,2; 180,-1,2];
-        bands = allBands(sel,:);
-        if isempty(bands), bands = zeros(0,3); end  % nothing selected -> all real edges occluded
-    end
-
-    % ------------------------------------------------------------------
-    %  Filter edges by allowable-rotation occlusion. Only "real" first-hop
-    %  edges (col3>0, direction column nonzero) carry a physical rotation
-    %  and are checked; free chain-continuation edges (col3==0) are left
-    %  alone here, since occluding the parent first-hop already makes the
-    %  whole chain unreachable via graph connectivity.
-    % ------------------------------------------------------------------
-    function eFiltered = filterEdgesByOcclusion(edgesIn, allowedBands)
-        keep = true(size(edgesIn,1),1);
-        for ei2 = 1:size(edgesIn,1)
-            if edgesIn(ei2,6) == 0, continue; end   % chain edge, not a physical rotation
-            angDeg = edgesIn(ei2,5); dirSign = edgesIn(ei2,6);
-            allowedHere = false;
-            for b = 1:size(allowedBands,1)
-                if dirSign == allowedBands(b,2) && abs(angDeg - allowedBands(b,1)) <= allowedBands(b,3)
-                    allowedHere = true; break;
-                end
-            end
-            if ~allowedHere, keep(ei2) = false; end
-        end
         eFiltered = edgesIn(keep,:);
     end
 
@@ -724,7 +681,6 @@ pathHandles = {};
         maxDeg  = getMaxAngle();
         eF      = filterEdgesByType(edges, allowed);
         eF      = filterEdgesByAngle(eF, maxDeg);
-        eF = filterEdgesByOcclusion(eF, getAllowedOcclusionBands());
 
         if state.globalSeqMode
             results = computeOptimalSequencesGlobal(numStable, eF, validPose, useCost, maxDeg);
@@ -781,7 +737,6 @@ pathHandles = {};
         maxDeg  = getMaxAngle();
         eF = filterEdgesByType(edges, allowed);
         eF = filterEdgesByAngle(eF, maxDeg);
-        eF = filterEdgesByOcclusion(eF, getAllowedOcclusionBands());
 
         [~, edgesS] = bfsShortestPath(A, B, numStable, eF);
         [~, edgesC] = dijkstraCheapestPath(A, B, numStable, eF);
@@ -861,7 +816,6 @@ pathHandles = {};
         maxDeg  = getMaxAngle();
         eF      = filterEdgesByType(edges, allowed);
         eF      = filterEdgesByAngle(eF, maxDeg);
-        eF = filterEdgesByOcclusion(eF, getAllowedOcclusionBands());
 
         if isToEnd
             % "→ END": find all START poses that can reach anchor via seq.
@@ -926,7 +880,6 @@ pathHandles = {};
         maxDeg  = getMaxAngle();
         eF      = filterEdgesByType(edges, allowed);
         eF      = filterEdgesByAngle(eF, maxDeg);
-        eF = filterEdgesByOcclusion(eF, getAllowedOcclusionBands());
 
         allResults = struct('startPose',{},'endPose',{},'edgeIdxList',{},'hops',{},'cost',{});
         for anchor = 1:numStable
@@ -1000,7 +953,6 @@ pathHandles = {};
         maxDeg  = getMaxAngle();
         eF      = filterEdgesByType(edges, allowed);
         eF      = filterEdgesByAngle(eF, maxDeg);
-        eF = filterEdgesByOcclusion(eF, getAllowedOcclusionBands());
 
         res = seqConstrainedSearch(A, B, seq, numStable, eF, useCost, maxDeg);
         clearPathHandles();
@@ -1085,7 +1037,7 @@ pathHandles = {};
             lbl='START'; if si==B, lbl='END'; end
             lines{end+1} = sprintf('[%s] Pose %d', lbl, si);
             lines{end+1} = sprintf('  Plane=%-2d  θ=%.0f°', pos.floorPlaneIdx, rad2deg(pos.theta));
-            lines{end+1} = sprintf('  rW=%.3f  rF=%.3f  rL=%.3f', ratioWall(si),ratioFloor(si),ratioLateral(si));
+            lines{end+1} = sprintf('  rW=%.3f  rF=%.3f', ratioWall(si),ratioFloor(si));
             lines{end+1} = sprintf('  Qs=%.4f', Qs(si));
         end
 
@@ -1193,8 +1145,8 @@ pathHandles = {};
 
     function resetAllBubbles()
         for si=1:numStable
-            [fc,ec]=bubbleColors(si,ratioWall,ratioFloor,ratioLateral, ...
-                THRESH_WALL,THRESH_FLOOR,THRESH_LATERAL,Qs);
+            [fc,ec]=bubbleColors(si,ratioWall,ratioFloor, ...
+                THRESH_WALL,THRESH_FLOOR,Qs);
             hBubble(si).FaceColor=fc; hBubble(si).EdgeColor=ec; hBubble(si).LineWidth=2.0;
         end
     end
@@ -1433,7 +1385,7 @@ end
             seqs{end+1} = current; %#ok<AGROW>
             return;
         end
-        for t = 1:3
+        for t = 1:4
             if isempty(current) || current(end) ~= t
                 buildSeq([current, t], remaining - 1);
             end
@@ -1700,7 +1652,7 @@ end
 %  seqToString
 % =========================================================================
 function s = seqToString(seq)
-names = {'W','F','L'};
+names = {'DW','DF','UW','UF'};
 if isempty(seq), s = '(none)'; return; end
 parts = cell(1, numel(seq));
 for k = 1:numel(seq), parts{k} = names{seq(k)}; end
@@ -1722,21 +1674,16 @@ end
 % =========================================================================
 %  bubbleColors
 % =========================================================================
-function [faceC, edgeC] = bubbleColors(si, ratioWall, ratioFloor, ratioLateral, ...
-    THRESH_WALL, THRESH_FLOOR, THRESH_LATERAL, Qs)
-hasWall    = (ratioWall(si)    >= THRESH_WALL);
-hasFloor   = (ratioFloor(si)   >= THRESH_FLOOR);
-hasLateral = (ratioLateral(si) >= THRESH_LATERAL);
+function [faceC, edgeC] = bubbleColors(si, ratioWall, ratioFloor, ...
+    THRESH_WALL, THRESH_FLOOR, Qs)
+hasWall    = (ratioWall(si)  >= THRESH_WALL);
+hasFloor   = (ratioFloor(si) >= THRESH_FLOOR);
 isZeroed   = (Qs(si) == 0);
-if isZeroed,                          faceC=[0.38 0.11 0.11]; edgeC=[0.72 0.22 0.22];
-elseif hasWall&&hasFloor&&hasLateral, faceC=[0.42 0.16 0.52]; edgeC=[0.78 0.42 0.92];
-elseif hasWall&&hasFloor,             faceC=[0.48 0.22 0.62]; edgeC=[0.78 0.52 0.92];
-elseif hasWall&&hasLateral,           faceC=[0.18 0.28 0.62]; edgeC=[0.48 0.58 0.92];
-elseif hasFloor&&hasLateral,          faceC=[0.12 0.40 0.42]; edgeC=[0.32 0.78 0.82];
-elseif hasWall,                       faceC=[0.12 0.32 0.60]; edgeC=[0.38 0.62 0.92];
-elseif hasFloor,                      faceC=[0.10 0.42 0.28]; edgeC=[0.28 0.78 0.52];
-elseif hasLateral,                    faceC=[0.38 0.16 0.42]; edgeC=[0.72 0.38 0.82];
-else,                                 faceC=[0.20 0.22 0.28]; edgeC=[0.52 0.56 0.68];
+if isZeroed,              faceC=[0.38 0.11 0.11]; edgeC=[0.72 0.22 0.22];
+elseif hasWall&&hasFloor, faceC=[0.48 0.22 0.62]; edgeC=[0.78 0.52 0.92];
+elseif hasWall,            faceC=[0.12 0.32 0.60]; edgeC=[0.38 0.62 0.92];
+elseif hasFloor,           faceC=[0.10 0.42 0.28]; edgeC=[0.28 0.78 0.52];
+else,                      faceC=[0.20 0.22 0.28]; edgeC=[0.52 0.56 0.68];
 end
 end
 
@@ -1746,8 +1693,8 @@ end
 % =========================================================================
 function s = edgeTypeStr(t)
 switch t
-    case 1,  s='wall';    case 2,  s='floor';   case 3,  s='lateral';
-    case 10, s='wall↓';  case 20, s='floor↓';  case 30, s='lat↓';
+    case 1,  s='dnWall';   case 2,  s='dnFloor';  case 3,  s='upWall';   case 4,  s='upFloor';
+    case 10, s='dnWall↓'; case 20, s='dnFloor↓'; case 30, s='upWall↓'; case 40, s='upFloor↓';
     otherwise, s='?';
 end
 end
@@ -1836,49 +1783,68 @@ end
 
 % =========================================================================
 %  resolveTransitionChain
-%  dirWant ('CW'/'CCW') governs ONLY the first physical hop of the chain;
-%  subsequent free-settle steps use 'auto' (natural continuation).
-%  CW/CCW convention: CW is when the part rotates about the transition's
-%  own axis (Wall=Z, Floor=Y, Lateral=X) in the direction that sweeps a
-%  reference point from quadrant IV to quadrant I (truePhi > 0); CCW is
-%  the opposite (truePhi < 0).
 % =========================================================================
-function [chainNodes,firstCost,transType,angleChangeDeg,edgeDir]=resolveTransitionChain( ...
-    srcSi,transType,dirWant,allPoses,stableIdx,refQuats,refQuatsAll, ...
-    ratioWall,ratioFloor,ratioLateral,Qs,validPose, ...
+function [chainNodes,firstCost,transType,angleChangeDeg]=resolveTransitionChain( ...
+    srcSi,transType,allPoses,stableIdx,refQuats,refQuatsAll, ...
+    Qs,validPose, ...
     quatMatchTol,planeTol,wallTol,maxChain, ...
     restingPlaneVerts,restingPlaneEqs,chullVertexIdx, ...
-    centroidCoords,planeQuats) %#ok<INUSL>
-chainNodes=[]; firstCost=0; angleChangeDeg=0; edgeDir=0;
+    centroidCoords,planeQuats,angleCapDeg,angleCostDenom)
+
+chainNodes=[]; firstCost=0; angleChangeDeg=0;
+
+% NOTE: cost is no longer seeded from ratioWall/ratioFloor here. All four
+% transition types (Down-Wall, Down-Floor, Up-Wall, Up-Floor) now use a
+% single, uniform cost basis: cumulative rotation angle, scaled by
+% angleCostDenom and capped at 1 (see firstCost assignment below, once a
+% valid landing pose is found). ratioWall/ratioFloor are still used
+% elsewhere (Qs zeroing, bubbleColors) — just not for edge cost.
+%
+% angleCapDeg is now the SAME 180° single-hop budget for all four
+% transition types (see MAX_HOP_ANGLE_DEG at the top of the script). If
+% the cumulative rotation across this chain's physical steps would exceed
+% it before reaching a valid landing pose, the chain is abandoned (no
+% edge built) — e.g. a 180° flip followed by a further 90° rotation is
+% two transitions, not one. The main graph-building loop already calls
+% this function fresh for every node (valid or not) as a source, so the
+% second transition is available as its own edge once the first lands.
+
 visited=false(numel(stableIdx),1); visited(srcSi)=true;
-curSi=srcSi; chain=srcSi;
+curSi=srcSi; chain=srcSi; cumAngle=0;
+
 for chainStep=1:maxChain
     [vertsC,centC]=initPose(curSi,allPoses,stableIdx); pos0=allPoses(stableIdx(curSi));
-    dw = 'auto'; if chainStep==1, dw = dirWant; end
-    if transType==1
-        contactIdx=pos0.wallContactVertIdx(:);
-        [vertsR,centR,~,~,~,q_rot,truePhi,dStr]=wallRotation_q(vertsC,centC,contactIdx,dw);
-    elseif transType==2
-        contactIdx=pos0.floorContactVertIdx(:);
-        [vertsR,centR,~,~,~,q_rot,truePhi,dStr]=floorRotation_q(vertsC,centC,contactIdx,dw);
-    else
-        contactIdx=pos0.floorContactVertIdx(:);
-        [vertsR,centR,~,~,~,q_rot,truePhi,dStr]=lateralRotation_q(vertsC,centC,contactIdx,dw);
+
+    switch transType
+        case 1
+            contactIdx=pos0.wallContactVertIdx(:);
+            [vertsR,centR,~,~,~,q_rot]=wallRotation_q(vertsC,centC,contactIdx);
+        case 2
+            contactIdx=pos0.floorContactVertIdx(:);
+            [vertsR,centR,~,~,~,q_rot]=floorRotation_q(vertsC,centC,contactIdx);
+        case 3
+            contactIdx=pos0.wallContactVertIdx(:);
+            [vertsR,centR,~,~,~,q_rot]=wallRotationUp_q(vertsC,centC,contactIdx);
+        case 4
+            contactIdx=pos0.floorContactVertIdx(:);
+            [vertsR,centR,~,~,~,q_rot]=floorRotationUp_q(vertsC,centC,contactIdx);
     end
-    if chainStep==1
-        if isempty(q_rot)
-            % requested rotation direction isn't geometrically available
-            % for this pose/pivot -> no edge for this (transType,dirWant)
-            chainNodes=[]; return;
-        end
-        angleChangeDeg = rad2deg(abs(truePhi));
-        edgeDir = 1; if strcmp(dStr,'CCW'), edgeDir = -1; end
-        firstCost = min(angleChangeDeg/180, 1);   % SCORE: 0=free, 1=max costly (180deg)
+
+    if isempty(q_rot), chainNodes=[]; return; end
+
+    q_id=[1 0 0 0];
+    stepAngleDeg=rad2deg(q_geodesic(q_id,q_rot));
+    cumAngle=cumAngle+stepAngleDeg;
+    if chainStep==1, angleChangeDeg=stepAngleDeg; end
+
+    if cumAngle > angleCapDeg
+        chainNodes=[]; return;
     end
+
     q_acc=refQuats(curSi,:);
-    if ~isempty(q_rot)
-        q_acc=q_compose(q_acc,q_rot); [~,mi]=max(abs(q_acc)); if q_acc(mi)<0, q_acc=-q_acc; end
-    end
+    q_acc=q_compose(q_acc,q_rot);
+    [~,mi]=max(abs(q_acc)); if q_acc(mi)<0, q_acc=-q_acc; end
+
     if isempty(vertsR), [vertsR,centR,~,~]=reseat(vertsC,centC); end
     [matchSi,~]=matchQuatComposed(q_acc,refQuatsAll,quatMatchTol);
     if matchSi==0
@@ -1887,11 +1853,19 @@ for chainStep=1:maxChain
             centroidCoords,planeQuats,refQuatsAll, ...
             planeTol,wallTol,quatMatchTol*3);
     end
-    if matchSi==0||matchSi==srcSi||visited(matchSi), return; end
+    if matchSi==0||matchSi==srcSi||visited(matchSi), chainNodes=[]; return; end
+
     chain(end+1)=matchSi; %#ok<AGROW>
-    if validPose(matchSi), chainNodes=chain; return; end
+    if validPose(matchSi)
+        chainNodes=chain;
+        % Uniform angle-based cost for ALL transition types, capped at 1:
+        %   1 deg of cumulative rotation = 1/angleCostDenom cost.
+        firstCost=min(cumAngle/angleCostDenom, 1);
+        return;
+    end
     visited(matchSi)=true; curSi=matchSi;
 end
+chainNodes=[];
 end
 
 
@@ -1933,18 +1907,10 @@ end
 
 
 % =========================================================================
-%  WALL / FLOOR / LATERAL ROTATION
-%  Each function now supports dirWant = 'auto' | 'CW' | 'CCW'. Two pivot
-%  neighbours are considered (the original "next" hull neighbour, and the
-%  opposite "prev" neighbour); each yields its own signed rotation, and we
-%  return whichever candidate matches the requested direction. 'auto'
-%  reproduces the original single-candidate behaviour exactly. If the
-%  requested direction has no valid geometric candidate for this pose,
-%  q_rot is returned empty (caller treats this as "no edge").
+%  WALL / FLOOR ROTATION  (down-chute and up-chute variants)
 % =========================================================================
-function [vertsR,centR,phi,pivotOut,axisOut,q_rot,truePhi,dirStr]=wallRotation_q(vertsC,centC,wallIdx,dirWant)
-if nargin<4, dirWant='auto'; end
-vertsR=[]; centR=[]; phi=0; pivotOut=[0,0,0]; axisOut=[0,0,1]; q_rot=[]; truePhi=0; dirStr='';
+function [vertsR,centR,phi,pivotOut,axisOut,q_rot]=wallRotation_q(vertsC,centC,wallIdx)
+vertsR=[]; centR=[]; phi=0; pivotOut=[0,0,0]; axisOut=[0,0,1]; q_rot=[];
 if isempty(wallIdx), return; end
 wallV=vertsC(wallIdx,:); [~,pivLoc]=max(wallV(:,1)); pivot=wallV(pivLoc,:); pivotOut=pivot;
 hullIdx3D=p4_hullIdx(vertsC); if numel(hullIdx3D)<3, return; end
@@ -1956,40 +1922,15 @@ ord2D=ord2D(1:end-1); pts2D=hXY(ord2D,:); M=size(pts2D,1); if M<2, return; end
 pivXY=pivot(1:2); dists=vecnorm(pts2D-pivXY,2,2); [~,pivLoc2D]=min(dists);
 prevLoc=mod(pivLoc2D-2,M)+1; nextLoc=mod(pivLoc2D,M)+1;
 prevXY=pts2D(prevLoc,:); nextXY=pts2D(nextLoc,:);
-
-dXn=nextXY(1)-pivXY(1); dYn=nextXY(2)-pivXY(2); phiN=atan2(-dYn,dXn);
-dXp=prevXY(1)-pivXY(1); dYp=prevXY(2)-pivXY(2); phiP=atan2(-dYp,dXp);
-
-cands=struct('phi',{},'truePhi',{},'dir',{});
-if abs(phiN)>=1e-8
-    d='CW'; if phiN<0, d='CCW'; end
-    cands(end+1)=struct('phi',phiN,'truePhi',phiN,'dir',d);
-end
-if abs(phiP)>=1e-8
-    d='CW'; if phiP<0, d='CCW'; end
-    cands(end+1)=struct('phi',phiP,'truePhi',phiP,'dir',d);
-end
-if isempty(cands), return; end
-
-switch dirWant
-    case 'auto'
-        if abs(phiN)>=1e-8, chosen=cands(1); else, chosen=cands(end); end
-    case {'CW','CCW'}
-        idx=find(strcmp({cands.dir},dirWant),1);
-        if isempty(idx), return; end
-        chosen=cands(idx);
-    otherwise
-        chosen=cands(1);
-end
-
-phi=chosen.phi; truePhi=chosen.truePhi; dirStr=chosen.dir;
+if nextXY(1)>=prevXY(1), neighXY=nextXY; else, neighXY=prevXY; end
+dX=neighXY(1)-pivXY(1); dY=neighXY(2)-pivXY(2);
+phi=atan2(-dY,dX); if abs(phi)<1e-8, return; end
 q_rot=q_fromAxisAngle([0,0,1],phi); axisOut=[0,0,1];
 [vertsR,centR]=q_rotateCloud(q_rot,vertsC,pivot,centC);
 end
 
-function [vertsR,centR,phi,pivotOut,axisOut,q_rot,truePhi,dirStr]=floorRotation_q(vertsC,centC,floorIdx,dirWant)
-if nargin<4, dirWant='auto'; end
-vertsR=[]; centR=[]; phi=0; pivotOut=[0,0,0]; axisOut=[0,1,0]; q_rot=[]; truePhi=0; dirStr='';
+function [vertsR,centR,phi,pivotOut,axisOut,q_rot]=floorRotation_q(vertsC,centC,floorIdx)
+vertsR=[]; centR=[]; phi=0; pivotOut=[0,0,0]; axisOut=[0,1,0]; q_rot=[];
 if isempty(floorIdx), return; end
 floorV=vertsC(floorIdx,:); [~,pivLoc]=max(floorV(:,1)); pivot=floorV(pivLoc,:); pivotOut=pivot;
 hullIdx3D=p4_hullIdx(vertsC); if numel(hullIdx3D)<3, return; end
@@ -2001,79 +1942,59 @@ ord2D=ord2D(1:end-1); pts2D=hXZ(ord2D,:); M=size(pts2D,1); if M<2, return; end
 pivXZ=pivot([1 3]); dists=vecnorm(pts2D-pivXZ,2,2); [~,pivLoc2D]=min(dists);
 prevLoc=mod(pivLoc2D-2,M)+1; nextLoc=mod(pivLoc2D,M)+1;
 prevXZ=pts2D(prevLoc,:); nextXZ=pts2D(nextLoc,:);
-
-dXn=nextXZ(1)-pivXZ(1); dZn=nextXZ(2)-pivXZ(2); phiN=atan2(-dZn,dXn);
-dXp=prevXZ(1)-pivXZ(1); dZp=prevXZ(2)-pivXZ(2); phiP=atan2(-dZp,dXp);
-
-cands=struct('phi',{},'truePhi',{},'dir',{});
-if abs(phiN)>=1e-8
-    tp=-phiN; d='CW'; if tp<0, d='CCW'; end
-    cands(end+1)=struct('phi',phiN,'truePhi',tp,'dir',d);
-end
-if abs(phiP)>=1e-8
-    tp=-phiP; d='CW'; if tp<0, d='CCW'; end
-    cands(end+1)=struct('phi',phiP,'truePhi',tp,'dir',d);
-end
-if isempty(cands), return; end
-
-switch dirWant
-    case 'auto'
-        if abs(phiN)>=1e-8, chosen=cands(1); else, chosen=cands(end); end
-    case {'CW','CCW'}
-        idx=find(strcmp({cands.dir},dirWant),1);
-        if isempty(idx), return; end
-        chosen=cands(idx);
-    otherwise
-        chosen=cands(1);
-end
-
-phi=chosen.phi; truePhi=chosen.truePhi; dirStr=chosen.dir;
+if nextXZ(1)>=prevXZ(1), neighXZ=nextXZ; else, neighXZ=prevXZ; end
+dX=neighXZ(1)-pivXZ(1); dZ=neighXZ(2)-pivXZ(2);
+phi=atan2(-dZ,dX); if abs(phi)<1e-8, return; end
 q_rot=q_fromAxisAngle([0,1,0],-phi); axisOut=[0,1,0];
 [vertsR,centR]=q_rotateCloud(q_rot,vertsC,pivot,centC);
 end
 
-function [vertsR,centR,phi,pivotOut,axisOut,q_rot,truePhi,dirStr]=lateralRotation_q(vertsC,centC,floorIdx,dirWant)
-if nargin<4, dirWant='auto'; end
-vertsR=[]; centR=[]; phi=0; pivotOut=[0,0,0]; axisOut=[1,0,0]; q_rot=[]; truePhi=0; dirStr='';
-if isempty(floorIdx), return; end
-floorV=vertsC(floorIdx,:); [~,pivLoc]=min(floorV(:,2)); pivot=floorV(pivLoc,:); pivotOut=pivot;
+% ---- Up-chute variants -------------------------------------------------
+% Mirror of wallRotation_q / floorRotation_q: pivots on the hull vertex
+% furthest AGAINST the direction of travel (min-X instead of max-X), since
+% up-chute tipping happens over the opposite edge. The prev/next neighbor
+% comparison direction is flipped to match (the "next" edge to rotate onto
+% is now on the other side of the pivot).
+function [vertsR,centR,phi,pivotOut,axisOut,q_rot]=wallRotationUp_q(vertsC,centC,wallIdx)
+vertsR=[]; centR=[]; phi=0; pivotOut=[0,0,0]; axisOut=[0,0,1]; q_rot=[];
+if isempty(wallIdx), return; end
+wallV=vertsC(wallIdx,:); [~,pivLoc]=min(wallV(:,1)); pivot=wallV(pivLoc,:); pivotOut=pivot;
 hullIdx3D=p4_hullIdx(vertsC); if numel(hullIdx3D)<3, return; end
-mTol=max(range(vertsC(:,2)),range(vertsC(:,3)))*1e-3;
-hYZ_raw=vertsC(hullIdx3D,[2 3]); hYZ=uniquetol(hYZ_raw,mTol,'ByRows',true,'DataScale',1);
-if size(hYZ,1)<3, return; end
-try ord2D=convhull(hYZ(:,1),hYZ(:,2)); catch; return; end
-ord2D=ord2D(1:end-1); pts2D=hYZ(ord2D,:); M=size(pts2D,1); if M<2, return; end
-pivYZ=pivot([2 3]); dists=vecnorm(pts2D-pivYZ,2,2); [~,pivLoc2D]=min(dists);
+mTol=max(range(vertsC(:,1)),range(vertsC(:,2)))*1e-3;
+hXY_raw=vertsC(hullIdx3D,1:2); hXY=uniquetol(hXY_raw,mTol,'ByRows',true,'DataScale',1);
+if size(hXY,1)<3, return; end
+try ord2D=convhull(hXY(:,1),hXY(:,2)); catch; return; end
+ord2D=ord2D(1:end-1); pts2D=hXY(ord2D,:); M=size(pts2D,1); if M<2, return; end
+pivXY=pivot(1:2); dists=vecnorm(pts2D-pivXY,2,2); [~,pivLoc2D]=min(dists);
 prevLoc=mod(pivLoc2D-2,M)+1; nextLoc=mod(pivLoc2D,M)+1;
-prevYZ=pts2D(prevLoc,:); nextYZ=pts2D(nextLoc,:);
-
-dYn=nextYZ(1)-pivYZ(1); dZn=nextYZ(2)-pivYZ(2); phiN=atan2(-dZn,-dYn);
-dYp=prevYZ(1)-pivYZ(1); dZp=prevYZ(2)-pivYZ(2); phiP=atan2(-dZp,-dYp);
-
-cands=struct('phi',{},'truePhi',{},'dir',{});
-if abs(phiN)>=1e-8
-    d='CW'; if phiN<0, d='CCW'; end
-    cands(end+1)=struct('phi',phiN,'truePhi',phiN,'dir',d);
-end
-if abs(phiP)>=1e-8
-    d='CW'; if phiP<0, d='CCW'; end
-    cands(end+1)=struct('phi',phiP,'truePhi',phiP,'dir',d);
-end
-if isempty(cands), return; end
-
-switch dirWant
-    case 'auto'
-        if abs(phiN)>=1e-8, chosen=cands(1); else, chosen=cands(end); end
-    case {'CW','CCW'}
-        idx=find(strcmp({cands.dir},dirWant),1);
-        if isempty(idx), return; end
-        chosen=cands(idx);
-    otherwise
-        chosen=cands(1);
+prevXY=pts2D(prevLoc,:); nextXY=pts2D(nextLoc,:);
+if nextXY(1)<=prevXY(1), neighXY=nextXY; else, neighXY=prevXY; end
+dX=neighXY(1)-pivXY(1); dY=neighXY(2)-pivXY(2);
+phi=-atan2(-dY,dX);
+if abs(phi)<1e-8, return; end
+q_rot=q_fromAxisAngle([0,0,1],phi); axisOut=[0,0,1];
+[vertsR,centR]=q_rotateCloud(q_rot,vertsC,pivot,centC);
 end
 
-phi=chosen.phi; truePhi=chosen.truePhi; dirStr=chosen.dir;
-q_rot=q_fromAxisAngle([1,0,0],phi); axisOut=[1,0,0];
+function [vertsR,centR,phi,pivotOut,axisOut,q_rot]=floorRotationUp_q(vertsC,centC,floorIdx)
+vertsR=[]; centR=[]; phi=0; pivotOut=[0,0,0]; axisOut=[0,1,0]; q_rot=[];
+if isempty(floorIdx), return; end
+floorV=vertsC(floorIdx,:); [~,pivLoc]=min(floorV(:,1)); pivot=floorV(pivLoc,:); pivotOut=pivot;
+hullIdx3D=p4_hullIdx(vertsC); if numel(hullIdx3D)<3, return; end
+mTol=max(range(vertsC(:,1)),range(vertsC(:,3)))*1e-3;
+hXZ_raw=vertsC(hullIdx3D,[1 3]); hXZ=uniquetol(hXZ_raw,mTol,'ByRows',true,'DataScale',1);
+if size(hXZ,1)<3, return; end
+try ord2D=convhull(hXZ(:,1),hXZ(:,2)); catch; return; end
+ord2D=ord2D(1:end-1); pts2D=hXZ(ord2D,:); M=size(pts2D,1); if M<2, return; end
+pivXZ=pivot([1 3]); dists=vecnorm(pts2D-pivXZ,2,2); [~,pivLoc2D]=min(dists);
+prevLoc=mod(pivLoc2D-2,M)+1; nextLoc=mod(pivLoc2D,M)+1;
+prevXZ=pts2D(prevLoc,:); nextXZ=pts2D(nextLoc,:);
+if nextXZ(1)<=prevXZ(1), neighXZ=nextXZ; else, neighXZ=prevXZ; end
+dX=neighXZ(1)-pivXZ(1); dZ=neighXZ(2)-pivXZ(2);
+phi=atan2(-dZ,dX);
+if abs(phi)<1e-8, return; end
+q_rot=q_fromAxisAngle([0,1,0],phi);
+axisOut=[0,1,0];
 [vertsR,centR]=q_rotateCloud(q_rot,vertsC,pivot,centC);
 end
 
@@ -2382,13 +2303,17 @@ tf=true;
 for k=1:size(src,1), if min(vecnorm(tgt-src(k,:),2,2))>tol, tf=false; return; end; end
 end
 
-function [ratioWall,ratioFloor,ratioLateral,transitions,momentArmGeo]=computeTransitionRatios( ...
+function [ratioWall,ratioFloor,transitions,momentArmGeo]=computeTransitionRatios( ...
     allPoses,stableIdx,Rchute,slideDir,floorNorm_c,wallNorm_c,planeTol) %#ok<INUSL>
+% NOTE: ratioWall/ratioFloor are still computed here for the stability
+% gating (Qs zeroing) and bubble-color logic — they are just no longer
+% used as edge cost inside resolveTransitionChain, which now uses a
+% uniform angle-based cost for every transition type.
 numS=numel(stableIdx);
-ratioWall=zeros(numS,1); ratioFloor=zeros(numS,1); ratioLateral=zeros(numS,1);
+ratioWall=zeros(numS,1); ratioFloor=zeros(numS,1);
 transitions=false(numS,1);
-eGeo=struct('pivotWall_c',[],'pivotFloor_c',[],'pivotLateral_c',[],'centC',[], ...
-    'l_A_wall',0,'l_w',0,'l_A_floor',0,'l_f',0,'l_A_lateral',0,'l_lat',0);
+eGeo=struct('pivotWall_c',[],'pivotFloor_c',[],'centC',[], ...
+    'l_A_wall',0,'l_w',0,'l_A_floor',0,'l_f',0);
 momentArmGeo=repmat(eGeo,numS,1);
 for si=1:numS
     pos=allPoses(stableIdx(si)); vC=pos.verticesWorld; cC=pos.centroidWorld(:)';
@@ -2407,12 +2332,6 @@ for si=1:numS
         l_A_f=abs(cC(3)); l_f=abs(cC(1)-pF(1));
         momentArmGeo(si).pivotFloor_c=pF; momentArmGeo(si).l_A_floor=l_A_f; momentArmGeo(si).l_f=l_f;
         if l_f>planeTol, ratioFloor(si)=l_A_f/l_f; end
-    end
-    if ~isempty(fV)
-        [~,iL]=min(fV(:,2)); pL=fV(iL,:);
-        l_A_lat=abs(cC(2)); l_lat=abs(cC(1)-pL(1));
-        momentArmGeo(si).pivotLateral_c=pL; momentArmGeo(si).l_A_lateral=l_A_lat; momentArmGeo(si).l_lat=l_lat;
-        if l_lat>planeTol, ratioLateral(si)=l_A_lat/l_lat; end
     end
 end
 end
