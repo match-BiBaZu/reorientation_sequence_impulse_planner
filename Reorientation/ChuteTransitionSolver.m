@@ -255,6 +255,29 @@ end % ChuteTransitionSolver
 
 
 % =========================================================================
+%  TRANSITION CATEGORY  (Wall vs Floor, direction-agnostic)
+% =========================================================================
+%  primType: 1=Down-Wall, 2=Down-Floor, 3=Up-Wall, 4=Up-Floor
+%  category: 1=Wall (primType 1 or 3), 2=Floor (primType 2 or 4)
+%
+%  This is the single source of truth for "a Wall transition is a Wall
+%  transition whether it's up-chute or down-chute" — every place that
+%  needs to treat Up/Down variants as interchangeable goes through this
+%  function instead of re-deriving the grouping locally.
+function c = catOf(primType)
+    if primType == 1 || primType == 3
+        c = 1;   % Wall
+    else
+        c = 2;   % Floor
+    end
+end
+
+function s = catLabel(primType)
+    if catOf(primType) == 1, s = 'Wall'; else, s = 'Floor'; end
+end
+
+
+% =========================================================================
 %  INTERACTIVE UI
 % =========================================================================
 function launchUI(numStable, stableIdx, allPoses, Qs, ratioWall, ratioFloor, ...
@@ -347,10 +370,7 @@ uipanel(hFig, 'Units','normalized', 'Position',[0.005, 0.005, 0.990, 0.115], ...
     'BackgroundColor',[0.08 0.09 0.12], 'ForegroundColor',[0.45 0.50 0.60], ...
     'Title','Sequence Constraints', 'FontSize',8, 'FontWeight','bold', 'BorderType','line');
 
-% Sequence constraints select the actuator array, not its rotation
-% direction.  A Wall slot therefore accepts both Down-Wall and Up-Wall
-% transitions; a Floor slot accepts both Down-Floor and Up-Floor.
-seqOpts    = {'—','Wall (Up/Down)','Floor (Up/Down)'};
+seqOpts    = {'—','Wall','Floor'};
 numSeqSlots = 6;
 hSeqDD     = gobjects(numSeqSlots,1);
 
@@ -1124,6 +1144,9 @@ pathHandles = {};
     end
 
     function seq = getSequence()
+        % Returns a vector of transition CATEGORIES (1=Wall, 2=Floor) —
+        % NOT primTypes. The dropdown itself only offers Wall/Floor now,
+        % so the popup Value (2=Wall,3=Floor) maps directly: category = v-1.
         seq = [];
         for k2 = 1:numSeqSlots
             v = hSeqDD(k2).Value;
@@ -1184,6 +1207,11 @@ end
 
 % =========================================================================
 %  mergeConsecutiveSameType
+%  Groups consecutive REAL (cost>0) edges into a single displayed "logical
+%  hop" whenever they share the same transition CATEGORY (Wall or Floor),
+%  regardless of Up/Down sub-type. E.g. Up-Wall immediately followed by
+%  Down-Wall merges into one "Wall ×2" entry, matching the sequence-search
+%  semantics in seqConstrainedSearch.
 % =========================================================================
 function mergedEdges = mergeConsecutiveSameType(edgeIdxList, edges)
 mergedEdges = struct('srcNode',{},'dstNode',{},'totalCost',{},'totalAngle',{}, ...
@@ -1193,19 +1221,25 @@ k=1;
 while k<=numel(edgeIdxList)
     ei=edgeIdxList(k); s=edges(ei,1); d=edges(ei,2); r=edges(ei,3);
     t=edges(ei,4); aDeg=edges(ei,5);
-    primType=mod(t-1,10)+1; isReal=(r>0);
+    primType=mod(t-1,10)+1; cat0=catOf(primType); isReal=(r>0);
     if isReal
-        totalCost=r; totalAngle=aDeg; hopCount=1; lastDst=d;
+        totalCost=r; totalAngle=aDeg; hopCount=1; lastDst=d; pureType=primType;
         while k+1<=numel(edgeIdxList)
             ei2=edgeIdxList(k+1); t2=edges(ei2,4); r2=edges(ei2,3);
             prim2=mod(t2-1,10)+1;
-            if prim2==primType && r2>0
+            if catOf(prim2)==cat0 && r2>0
                 totalCost=totalCost+r2; totalAngle=totalAngle+edges(ei2,5);
                 hopCount=hopCount+1; lastDst=edges(ei2,2); k=k+1;
+                if prim2~=pureType, pureType=-1; end   % mixed Up/Down within the run
             else; break; end
         end
         me.srcNode=s; me.dstNode=lastDst; me.totalCost=totalCost;
-        me.totalAngle=totalAngle; me.typeStr=edgeTypeStr(t);
+        me.totalAngle=totalAngle;
+        if hopCount>1 && pureType==-1
+            me.typeStr = catLabel(primType);           % mixed run -> generic "Wall"/"Floor"
+        else
+            me.typeStr = edgeTypeStr(t);                % single/uniform -> exact sub-type
+        end
         me.hopCount=hopCount; me.isMerged=(hopCount>1);
     else
         me.srcNode=s; me.dstNode=d; me.totalCost=0; me.totalAngle=aDeg;
@@ -1218,18 +1252,22 @@ end
 
 % =========================================================================
 %  countRealHops
+%  Counts logical hops by transition CATEGORY (Wall/Floor), so a run that
+%  alternates Up-Wall/Down-Wall still counts as a single hop — consistent
+%  with mergeConsecutiveSameType and the sequence-search matching logic.
 % =========================================================================
 function n = countRealHops(edgeIdxList, edges)
 n        = 0;
-lastType = -1;
+lastCat  = -1;
 for k = 1:numel(edgeIdxList)
     ei       = edgeIdxList(k);
     cost     = edges(ei, 3);
     if cost == 0, continue; end
     primType = mod(edges(ei, 4) - 1, 10) + 1;
-    if primType ~= lastType
-        n        = n + 1;
-        lastType = primType;
+    cat0     = catOf(primType);
+    if cat0 ~= lastCat
+        n       = n + 1;
+        lastCat = cat0;
     end
 end
 end
@@ -1251,7 +1289,7 @@ function results = computeOptimalSequencesGlobal( ...
 results = struct('seq',{}, 'direction',{}, 'coverage',{}, ...
                  'totalHops',{}, 'avgHops',{}, 'avgMetric',{}, 'totalMetric',{});
 
-allSeqs = enumSeqs(4, 2);
+allSeqs = enumSeqs(4);
 
 for si = 1:numel(allSeqs)
     seq = allSeqs{si};
@@ -1298,10 +1336,10 @@ for si = 1:numel(allSeqs)
 end
 
 if ~isempty(results)
-    covs  = [results.coverage];
-    thops = [results.totalHops];
-    avgs  = [results.avgMetric];
-    [~, ord] = sortrows([-covs(:), thops(:), avgs(:)]);
+    covs    = [results.coverage]';
+    seqLens = cellfun(@numel, {results.seq})';
+    avgs    = [results.avgMetric]';
+    [~, ord] = sortrows([-covs, seqLens, avgs]);
     results  = results(ord);
     results  = results(1:min(20, numel(results)));
 end
@@ -1323,7 +1361,7 @@ results = struct('seq',{}, 'direction',{}, 'coverage',{}, ...
 
 if ~validPose(anchor), return; end
 
-allSeqs = enumSeqs(4, 2);
+allSeqs = enumSeqs(4);
 
 for si = 1:numel(allSeqs)
     seq = allSeqs{si};
@@ -1376,8 +1414,11 @@ end
 
 % =========================================================================
 %  enumSeqs
+%  Enumerates sequences over the transition CATEGORY alphabet {1=Wall,
+%  2=Floor} rather than the 4 primTypes, since the sequence UI/search
+%  layer now only distinguishes Wall vs Floor.
 % =========================================================================
-function seqs = enumSeqs(maxLen, numArrayTypes)
+function seqs = enumSeqs(maxLen)
 seqs = {};
 for len = 1:maxLen
     buildSeq([], len);
@@ -1388,7 +1429,7 @@ end
             seqs{end+1} = current; %#ok<AGROW>
             return;
         end
-        for t = 1:numArrayTypes
+        for t = 1:2
             if isempty(current) || current(end) ~= t
                 buildSeq([current, t], remaining - 1);
             end
@@ -1401,7 +1442,7 @@ end
 %  renderPoseAxes
 % =========================================================================
 function renderPoseAxes(ax, pos, si, label, Rchute, partFaces)
-cla(ax); hold(ax,'on'); axis(ax,'equal'); view(ax,40,24); grid(ax,'on');
+cla(ax); hold(ax,'on'); axis(ax,'equal'); grid(ax,'on');
 set(ax,'Color',[0.09 0.10 0.13],'XColor',[0.38 0.40 0.48],'YColor',[0.38 0.40 0.48], ...
     'ZColor',[0.38 0.40 0.48],'GridColor',[0.22 0.23 0.28],'GridAlpha',0.3,'FontSize',7);
 vertsC=pos.verticesWorld; centC=pos.centroidWorld(:)';
@@ -1409,6 +1450,23 @@ floorIdx=pos.floorContactVertIdx; wallIdx=pos.wallContactVertIdx;
 floorZ=min(vertsC(floorIdx,3)); vertsC(:,3)=vertsC(:,3)-floorZ; centC(3)=centC(3)-floorZ;
 wallY=max(vertsC(wallIdx,2)); vertsC(:,2)=vertsC(:,2)-wallY; centC(2)=centC(2)-wallY;
 vertsW=(Rchute*vertsC')'; centW=(Rchute*centC(:))';
+
+% ── DISPLAY-ONLY mirror + rotate ────────────────────────────────────────
+% Flip the rendered geometry about the yz-plane (x -> -x). This is purely
+% a viewer transform: it only affects vertsW/centW/partFaces as used in
+% THIS function, never the underlying pos data, so nothing downstream
+% (transitions, sequence search, ratios, etc.) is touched.
+% Mirroring reverses triangle winding (and therefore face-normal
+% direction), so the face vertex order is flipped to keep lighting
+% correct. The camera azimuth is negated ("...and rotate") to compensate
+% for the handedness flip so the part still reads naturally in 3D.
+vertsW(:,1) = -vertsW(:,1);
+centW(1)    = -centW(1);
+if ~isempty(partFaces)
+    partFaces = partFaces(:, [1 3 2]);
+end
+view(ax, -40, 24);
+
 if ~isempty(partFaces)
     trisurf(partFaces,vertsW(:,1),vertsW(:,2),vertsW(:,3),'Parent',ax, ...
         'FaceColor',[1.00 0.92 0.22],'FaceAlpha',0.55,'EdgeColor',[0.38 0.32 0.00],'EdgeAlpha',0.12);
@@ -1498,6 +1556,12 @@ end
 
 % =========================================================================
 %  seqConstrainedSearch
+%  seq is a vector of CATEGORIES (1=Wall, 2=Floor). A slot is satisfied
+%  by ANY edge whose catOf(primType) matches — i.e. Up-Wall and Down-Wall
+%  are interchangeable within a Wall slot, and likewise for Floor. This
+%  applies both when first entering a slot and when extending a run
+%  within the same slot (so "up-wall, down-wall, down-floor" satisfies
+%  the same [Wall, Floor] sequence as "down-wall, down-wall, down-floor").
 % =========================================================================
 function result = seqConstrainedSearch(startPose, endPose, seq, numNodes, edges, useCost, maxDeg)
 result.startPose   = startPose;
@@ -1513,7 +1577,7 @@ numStates = numNodes * (nSeq + 1);
 dist        = INF * ones(numStates, 1);
 prevState   = zeros(numStates, 1);
 prevEdge    = zeros(numStates, 1);
-runAngle    = zeros(numStates, 1);   % cumulative angle of current same-type run
+runAngle    = zeros(numStates, 1);   % cumulative angle of current same-category run
 runStart    = zeros(numStates, 1);   % node where the current run began
 unvisited   = true(numStates, 1);
 
@@ -1567,7 +1631,8 @@ for iter = 1:numStates
         nb       = edges(ei, 2);
         eCost    = edges(ei, 3);
         eType    = edges(ei, 4);
-        arrayType = transitionArrayType(eType);
+        primType = mod(eType - 1, 10) + 1;
+        eCat     = catOf(primType);   % Wall/Floor category — direction-agnostic
         eAng     = edges(ei, 5);
         isChain  = (eCost == 0);
 
@@ -1598,7 +1663,9 @@ for iter = 1:numStates
 
         else
             % --- advance to a NEW sequence slot: starts a fresh run ---
-            if curSP < nSeq && arrayType == seq(curSP + 1)
+            % Any Wall edge (Up or Down) satisfies a "Wall" slot; any
+            % Floor edge (Up or Down) satisfies a "Floor" slot.
+            if curSP < nSeq && eCat == seq(curSP + 1)
                 newSP = curSP + 1;
                 ns    = newSP * numNodes + nb;
                 w     = eCost; if ~useCost, w = 1; end
@@ -1612,10 +1679,11 @@ for iter = 1:numStates
                 end
             end
 
-            % --- stay in the SAME slot: extend the current array run ---
-            % Up/down direction may change; the selected actuator array
-            % (Wall or Floor) must remain the same.
-            if curSP > 0 && arrayType == seq(curSP)
+            % --- stay in the SAME slot: extend the current same-category run ---
+            % An Up-Wall hop can directly follow a Down-Wall hop (or vice
+            % versa) within the same "Wall" slot — only the category has
+            % to match, not the exact sub-type.
+            if curSP > 0 && eCat == seq(curSP)
                 newRunAngle = runAngle(curState) + eAng;
                 if newRunAngle > maxDeg
                     continue;   % cumulative rotation over the cap — prune
@@ -1655,24 +1723,14 @@ end
 
 % =========================================================================
 %  seqToString
+%  seq entries are CATEGORIES now (1=Wall, 2=Floor).
 % =========================================================================
 function s = seqToString(seq)
-names = {'Wall (Up/Down)','Floor (Up/Down)'};
+names = {'Wall','Floor'};
 if isempty(seq), s = '(none)'; return; end
 parts = cell(1, numel(seq));
 for k = 1:numel(seq), parts{k} = names{seq(k)}; end
 s = strjoin(parts, ' → ');
-end
-
-
-% =========================================================================
-%  transitionArrayType
-%  Collapse physical rotation direction into the actuator array used by
-%  sequence constraints: Down/Up-Wall -> 1, Down/Up-Floor -> 2.
-% =========================================================================
-function arrayType = transitionArrayType(edgeType)
-primType = mod(edgeType - 1, 10) + 1;
-arrayType = mod(primType - 1, 2) + 1;
 end
 
 
@@ -1824,6 +1882,11 @@ chainNodes=[]; firstCost=0; angleChangeDeg=0;
 % two transitions, not one. The main graph-building loop already calls
 % this function fresh for every node (valid or not) as a source, so the
 % second transition is available as its own edge once the first lands.
+%
+% NOTE: this function still builds the RAW per-primType (1-4) physical
+% edges — the Wall/Floor category collapsing happens one layer up, in the
+% sequence-search functions (seqConstrainedSearch, countRealHops,
+% mergeConsecutiveSameType) via catOf(). This function is unchanged.
 
 visited=false(numel(stableIdx),1); visited(srcSi)=true;
 curSi=srcSi; chain=srcSi; cumAngle=0;
