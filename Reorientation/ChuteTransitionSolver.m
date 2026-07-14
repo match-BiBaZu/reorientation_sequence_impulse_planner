@@ -347,7 +347,10 @@ uipanel(hFig, 'Units','normalized', 'Position',[0.005, 0.005, 0.990, 0.115], ...
     'BackgroundColor',[0.08 0.09 0.12], 'ForegroundColor',[0.45 0.50 0.60], ...
     'Title','Sequence Constraints', 'FontSize',8, 'FontWeight','bold', 'BorderType','line');
 
-seqOpts    = {'—','Down-Wall','Down-Floor','Up-Wall','Up-Floor'};
+% Sequence constraints select the actuator array, not its rotation
+% direction.  A Wall slot therefore accepts both Down-Wall and Up-Wall
+% transitions; a Floor slot accepts both Down-Floor and Up-Floor.
+seqOpts    = {'—','Wall (Up/Down)','Floor (Up/Down)'};
 numSeqSlots = 6;
 hSeqDD     = gobjects(numSeqSlots,1);
 
@@ -1248,7 +1251,7 @@ function results = computeOptimalSequencesGlobal( ...
 results = struct('seq',{}, 'direction',{}, 'coverage',{}, ...
                  'totalHops',{}, 'avgHops',{}, 'avgMetric',{}, 'totalMetric',{});
 
-allSeqs = enumSeqs(4);
+allSeqs = enumSeqs(4, 2);
 
 for si = 1:numel(allSeqs)
     seq = allSeqs{si};
@@ -1320,7 +1323,7 @@ results = struct('seq',{}, 'direction',{}, 'coverage',{}, ...
 
 if ~validPose(anchor), return; end
 
-allSeqs = enumSeqs(4);
+allSeqs = enumSeqs(4, 2);
 
 for si = 1:numel(allSeqs)
     seq = allSeqs{si};
@@ -1374,7 +1377,7 @@ end
 % =========================================================================
 %  enumSeqs
 % =========================================================================
-function seqs = enumSeqs(maxLen)
+function seqs = enumSeqs(maxLen, numArrayTypes)
 seqs = {};
 for len = 1:maxLen
     buildSeq([], len);
@@ -1385,7 +1388,7 @@ end
             seqs{end+1} = current; %#ok<AGROW>
             return;
         end
-        for t = 1:4
+        for t = 1:numArrayTypes
             if isempty(current) || current(end) ~= t
                 buildSeq([current, t], remaining - 1);
             end
@@ -1564,7 +1567,7 @@ for iter = 1:numStates
         nb       = edges(ei, 2);
         eCost    = edges(ei, 3);
         eType    = edges(ei, 4);
-        primType = mod(eType - 1, 10) + 1;
+        arrayType = transitionArrayType(eType);
         eAng     = edges(ei, 5);
         isChain  = (eCost == 0);
 
@@ -1595,7 +1598,7 @@ for iter = 1:numStates
 
         else
             % --- advance to a NEW sequence slot: starts a fresh run ---
-            if curSP < nSeq && primType == seq(curSP + 1)
+            if curSP < nSeq && arrayType == seq(curSP + 1)
                 newSP = curSP + 1;
                 ns    = newSP * numNodes + nb;
                 w     = eCost; if ~useCost, w = 1; end
@@ -1609,8 +1612,10 @@ for iter = 1:numStates
                 end
             end
 
-            % --- stay in the SAME slot: extend the current same-type run ---
-            if curSP > 0 && primType == seq(curSP)
+            % --- stay in the SAME slot: extend the current array run ---
+            % Up/down direction may change; the selected actuator array
+            % (Wall or Floor) must remain the same.
+            if curSP > 0 && arrayType == seq(curSP)
                 newRunAngle = runAngle(curState) + eAng;
                 if newRunAngle > maxDeg
                     continue;   % cumulative rotation over the cap — prune
@@ -1652,11 +1657,22 @@ end
 %  seqToString
 % =========================================================================
 function s = seqToString(seq)
-names = {'DW','DF','UW','UF'};
+names = {'Wall (Up/Down)','Floor (Up/Down)'};
 if isempty(seq), s = '(none)'; return; end
 parts = cell(1, numel(seq));
 for k = 1:numel(seq), parts{k} = names{seq(k)}; end
 s = strjoin(parts, ' → ');
+end
+
+
+% =========================================================================
+%  transitionArrayType
+%  Collapse physical rotation direction into the actuator array used by
+%  sequence constraints: Down/Up-Wall -> 1, Down/Up-Floor -> 2.
+% =========================================================================
+function arrayType = transitionArrayType(edgeType)
+primType = mod(edgeType - 1, 10) + 1;
+arrayType = mod(primType - 1, 2) + 1;
 end
 
 
