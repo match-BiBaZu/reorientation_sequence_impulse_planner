@@ -209,7 +209,8 @@ for si = 1:numStable
             Qs, validPose, ...
             quatMatchTol, planeTol, wallTol, maxChain, ...
             restingPlaneVerts, restingPlaneEqs, chullVertexIdx, ...
-            centroidCoords, planeQuats, angleCap, ANGLE_COST_DENOM);
+            centroidCoords, planeQuats, angleCap, ANGLE_COST_DENOM, ...
+            ratioWall, ratioFloor, THRESH_WALL, THRESH_FLOOR);
 
         if numel(chainNodes) < 2, continue; end
 
@@ -710,6 +711,19 @@ pathHandles = {};
         else
             results = computeOptimalSequencesIndividual(anchor, numStable, eF, validPose, useCost, hDirDD.Value==1, maxDeg);
         end
+
+        dbgLines = {};
+        dbgLines{end+1} = sprintf('=== DEBUG: %d candidate sequences ===', numel(results));
+        for di = 1:numel(results)
+            r = results(di);
+            dbgLines{end+1} = sprintf('#%d seq=%s len=%d cov=%d hops=%d avgMetric=%.4f dir=%s', ...
+                di, seqToString(r.seq), numel(r.seq), r.coverage, r.totalHops, r.avgMetric, r.direction);
+        end
+        dbgLines{end+1} = '=== END DEBUG ===';
+        hInfoList.String = dbgLines;
+        hInfoList.Value  = [];
+        drawnow;
+        uiwait(msgbox('Debug data is in the right panel — click OK to continue', 'Paused', 'modal'));
 
         if isempty(results)
             hStatusTxt.String = 'No valid sequences found for this network';
@@ -1336,10 +1350,11 @@ for si = 1:numel(allSeqs)
 end
 
 if ~isempty(results)
-    covs    = [results.coverage]';
-    seqLens = cellfun(@numel, {results.seq})';
-    avgs    = [results.avgMetric]';
-    [~, ord] = sortrows([-covs, seqLens, avgs]);
+    covs    = [results.coverage];
+    seqLens = arrayfun(@(r) numel(r.seq), results);
+    thops   = [results.totalHops];
+    avgs    = [results.avgMetric];
+    [~, ord] = sortrows([-covs(:), seqLens(:), thops(:), avgs(:)]);
     results  = results(ord);
     results  = results(1:min(20, numel(results)));
 end
@@ -1398,10 +1413,11 @@ for si = 1:numel(allSeqs)
 end
 
 if ~isempty(results)
-    covs  = [results.coverage];
-    thops = [results.totalHops];
-    avgs  = [results.avgMetric];
-    [~, ord] = sortrows([-covs(:), thops(:), avgs(:)]);
+    covs    = [results.coverage];
+    seqLens = arrayfun(@(r) numel(r.seq), results);
+    thops   = [results.totalHops];
+    avgs    = [results.avgMetric];
+    [~, ord] = sortrows([-covs(:), seqLens(:), thops(:), avgs(:)]);
     results  = results(ord);
     results  = results(1:min(20, numel(results)));
 end
@@ -1863,7 +1879,8 @@ function [chainNodes,firstCost,transType,angleChangeDeg]=resolveTransitionChain(
     Qs,validPose, ...
     quatMatchTol,planeTol,wallTol,maxChain, ...
     restingPlaneVerts,restingPlaneEqs,chullVertexIdx, ...
-    centroidCoords,planeQuats,angleCapDeg,angleCostDenom)
+    centroidCoords,planeQuats,angleCapDeg,angleCostDenom, ...
+    ratioWall,ratioFloor,THRESH_WALL,THRESH_FLOOR)
 
 chainNodes=[]; firstCost=0; angleChangeDeg=0;
 
@@ -1909,20 +1926,24 @@ for chainStep=1:maxChain
             [vertsR,centR,~,~,~,q_rot]=floorRotationUp_q(vertsC,centC,contactIdx);
     end
 
-    if isempty(q_rot), chainNodes=[]; return; end
-
     q_id=[1 0 0 0];
-    stepAngleDeg=rad2deg(q_geodesic(q_id,q_rot));
-    cumAngle=cumAngle+stepAngleDeg;
-    if chainStep==1, angleChangeDeg=stepAngleDeg; end
+    if ~isempty(q_rot)
+        stepAngleDeg = rad2deg(q_geodesic(q_id,q_rot));
+    else
+        stepAngleDeg = 0;   % degenerate/zero rotation — fall through, don't abort
+    end
+    cumAngle = cumAngle + stepAngleDeg;
+    if chainStep==1, angleChangeDeg = stepAngleDeg; end
 
-    if cumAngle > angleCapDeg
+    if stepAngleDeg > 359  % essentially "rotation computation failed", not a real cap
         chainNodes=[]; return;
     end
 
-    q_acc=refQuats(curSi,:);
-    q_acc=q_compose(q_acc,q_rot);
-    [~,mi]=max(abs(q_acc)); if q_acc(mi)<0, q_acc=-q_acc; end
+    q_acc = refQuats(curSi,:);
+    if ~isempty(q_rot)
+        q_acc = q_compose(q_acc,q_rot);
+        [~,mi]=max(abs(q_acc)); if q_acc(mi)<0, q_acc=-q_acc; end
+    end
 
     if isempty(vertsR), [vertsR,centR,~,~]=reseat(vertsC,centC); end
     [matchSi,~]=matchQuatComposed(q_acc,refQuatsAll,quatMatchTol);
@@ -1937,9 +1958,28 @@ for chainStep=1:maxChain
     chain(end+1)=matchSi; %#ok<AGROW>
     if validPose(matchSi)
         chainNodes=chain;
-        % Uniform angle-based cost for ALL transition types, capped at 1:
-        %   1 deg of cumulative rotation = 1/angleCostDenom cost.
-        firstCost=min(cumAngle/angleCostDenom, 1);
+        angleCost = min(cumAngle/angleCostDenom, 1);
+
+        if transType==1 || transType==2
+            % Down-chute: unchanged — pure angle-based cost only.
+            firstCost = angleCost;
+        else
+            % Up-chute (transType 3=Up-Wall, 4=Up-Floor): tipping AGAINST
+            % gravity means the source pose's own stability margin matters
+            % — instability doesn't help here, it's a real penalty (risk of
+            % an uncontrolled/wrong-direction topple), so fold the source
+            % pose's moment-arm ratio into the cost on top of the angle
+            % cost. Ratio is normalized by its own threshold so it's on a
+            % comparable ~0-1+ scale to angleCost; poses near/over their
+            % stability threshold (already excluded as chain sources once
+            % Qs is zeroed) contribute a correspondingly larger penalty.
+            if transType==3
+                instabTerm = ratioWall(srcSi) / THRESH_WALL;
+            else
+                instabTerm = ratioFloor(srcSi) / THRESH_FLOOR;
+            end
+            firstCost = angleCost + instabTerm;
+        end
         return;
     end
     visited(matchSi)=true; curSi=matchSi;
@@ -1999,9 +2039,12 @@ if size(hXY,1)<3, return; end
 try ord2D=convhull(hXY(:,1),hXY(:,2)); catch; return; end
 ord2D=ord2D(1:end-1); pts2D=hXY(ord2D,:); M=size(pts2D,1); if M<2, return; end
 pivXY=pivot(1:2); dists=vecnorm(pts2D-pivXY,2,2); [~,pivLoc2D]=min(dists);
-prevLoc=mod(pivLoc2D-2,M)+1; nextLoc=mod(pivLoc2D,M)+1;
-prevXY=pts2D(prevLoc,:); nextXY=pts2D(nextLoc,:);
-if nextXY(1)>=prevXY(1), neighXY=nextXY; else, neighXY=prevXY; end
+prevXY=findFirstOffPlane(pts2D,pivLoc2D,M,-1,2,mTol);
+nextXY=findFirstOffPlane(pts2D,pivLoc2D,M,+1,2,mTol);
+if isempty(prevXY)&&isempty(nextXY), return; end
+if isempty(nextXY), neighXY=prevXY;
+elseif isempty(prevXY), neighXY=nextXY;
+elseif nextXY(1)>=prevXY(1), neighXY=nextXY; else, neighXY=prevXY; end
 dX=neighXY(1)-pivXY(1); dY=neighXY(2)-pivXY(2);
 phi=atan2(-dY,dX); if abs(phi)<1e-8, return; end
 q_rot=q_fromAxisAngle([0,0,1],phi); axisOut=[0,0,1];
@@ -2019,9 +2062,12 @@ if size(hXZ,1)<3, return; end
 try ord2D=convhull(hXZ(:,1),hXZ(:,2)); catch; return; end
 ord2D=ord2D(1:end-1); pts2D=hXZ(ord2D,:); M=size(pts2D,1); if M<2, return; end
 pivXZ=pivot([1 3]); dists=vecnorm(pts2D-pivXZ,2,2); [~,pivLoc2D]=min(dists);
-prevLoc=mod(pivLoc2D-2,M)+1; nextLoc=mod(pivLoc2D,M)+1;
-prevXZ=pts2D(prevLoc,:); nextXZ=pts2D(nextLoc,:);
-if nextXZ(1)>=prevXZ(1), neighXZ=nextXZ; else, neighXZ=prevXZ; end
+prevXZ=findFirstOffPlane(pts2D,pivLoc2D,M,-1,2,mTol);
+nextXZ=findFirstOffPlane(pts2D,pivLoc2D,M,+1,2,mTol);
+if isempty(prevXZ)&&isempty(nextXZ), return; end
+if isempty(nextXZ), neighXZ=prevXZ;
+elseif isempty(prevXZ), neighXZ=nextXZ;
+elseif nextXZ(1)>=prevXZ(1), neighXZ=nextXZ; else, neighXZ=prevXZ; end
 dX=neighXZ(1)-pivXZ(1); dZ=neighXZ(2)-pivXZ(2);
 phi=atan2(-dZ,dX); if abs(phi)<1e-8, return; end
 q_rot=q_fromAxisAngle([0,1,0],-phi); axisOut=[0,1,0];
@@ -2045,9 +2091,12 @@ if size(hXY,1)<3, return; end
 try ord2D=convhull(hXY(:,1),hXY(:,2)); catch; return; end
 ord2D=ord2D(1:end-1); pts2D=hXY(ord2D,:); M=size(pts2D,1); if M<2, return; end
 pivXY=pivot(1:2); dists=vecnorm(pts2D-pivXY,2,2); [~,pivLoc2D]=min(dists);
-prevLoc=mod(pivLoc2D-2,M)+1; nextLoc=mod(pivLoc2D,M)+1;
-prevXY=pts2D(prevLoc,:); nextXY=pts2D(nextLoc,:);
-if nextXY(1)<=prevXY(1), neighXY=nextXY; else, neighXY=prevXY; end
+prevXY=findFirstOffPlane(pts2D,pivLoc2D,M,-1,2,mTol);
+nextXY=findFirstOffPlane(pts2D,pivLoc2D,M,+1,2,mTol);
+if isempty(prevXY)&&isempty(nextXY), return; end
+if isempty(nextXY), neighXY=prevXY;
+elseif isempty(prevXY), neighXY=nextXY;
+elseif nextXY(1)<=prevXY(1), neighXY=nextXY; else, neighXY=prevXY; end
 dX=neighXY(1)-pivXY(1); dY=neighXY(2)-pivXY(2);
 phi=-atan2(-dY,dX);
 if abs(phi)<1e-8, return; end
@@ -2066,9 +2115,12 @@ if size(hXZ,1)<3, return; end
 try ord2D=convhull(hXZ(:,1),hXZ(:,2)); catch; return; end
 ord2D=ord2D(1:end-1); pts2D=hXZ(ord2D,:); M=size(pts2D,1); if M<2, return; end
 pivXZ=pivot([1 3]); dists=vecnorm(pts2D-pivXZ,2,2); [~,pivLoc2D]=min(dists);
-prevLoc=mod(pivLoc2D-2,M)+1; nextLoc=mod(pivLoc2D,M)+1;
-prevXZ=pts2D(prevLoc,:); nextXZ=pts2D(nextLoc,:);
-if nextXZ(1)<=prevXZ(1), neighXZ=nextXZ; else, neighXZ=prevXZ; end
+prevXZ=findFirstOffPlane(pts2D,pivLoc2D,M,-1,2,mTol);
+nextXZ=findFirstOffPlane(pts2D,pivLoc2D,M,+1,2,mTol);
+if isempty(prevXZ)&&isempty(nextXZ), return; end
+if isempty(nextXZ), neighXZ=prevXZ;
+elseif isempty(prevXZ), neighXZ=nextXZ;
+elseif nextXZ(1)<=prevXZ(1), neighXZ=nextXZ; else, neighXZ=prevXZ; end
 dX=neighXZ(1)-pivXZ(1); dZ=neighXZ(2)-pivXZ(2);
 phi=atan2(-dZ,dX);
 if abs(phi)<1e-8, return; end
@@ -2417,4 +2469,25 @@ end
 
 function v=normaliseVec(v)
 n=norm(v); if n>0, v=v/n; end
+end
+
+% =========================================================================
+%  findFirstOffPlane
+%  Walks the ordered 2D hull polygon outward from startLoc in direction
+%  dir (+1 or -1), skipping any vertex whose planeCol coordinate is
+%  within tol of the pivot's own value (still flush on the same contact
+%  face as the pivot), and returns the first vertex that genuinely lifts
+%  off that plane. Returns [] if the whole hull is flush in that
+%  direction (a truly degenerate/immovable contact).
+% =========================================================================
+function pt = findFirstOffPlane(pts2D, startLoc, M, dir, planeCol, tol)
+pt = [];
+baseVal = pts2D(startLoc, planeCol);
+for step = 1:M-1
+    loc = mod(startLoc-1 + dir*step, M) + 1;
+    if abs(pts2D(loc,planeCol) - baseVal) > tol
+        pt = pts2D(loc,:);
+        return;
+    end
+end
 end
